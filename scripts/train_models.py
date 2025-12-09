@@ -59,43 +59,48 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     # Training with progress bar
     callbacks = [
         lgb.early_stopping(stopping_rounds=50),
-        lgb.log_evaluation(period=100)
     ]
     
     # Custom progress callback
     class ProgressCallback:
         def __init__(self, total_iterations):
-            self.pbar = tqdm(total=total_iterations, desc=f"{symbol} - LightGBM", 
+            self.pbar = tqdm(total=total_iterations, desc=f"{symbol} - LightGBM",
                            unit="iter", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
             self.best_score = float('inf')
-            
+
         def __call__(self, env):
-            current_iter = env.iteration
+            current_iter = env.iteration + 1  # iteration is 0-indexed
             eval_result = env.evaluation_result_list
-            
+
+            train_loss = None
+            val_loss = None
+
             if eval_result:
-                train_loss = None
-                val_loss = None
-                for metric_name, metric_value, is_higher_better in eval_result:
-                    if "train" in metric_name and "multi_logloss" in metric_name:
-                        train_loss = metric_value
-                    elif "valid" in metric_name and "multi_logloss" in metric_name:
-                        val_loss = metric_value
-                
-                if val_loss is not None:
-                    if val_loss < self.best_score:
-                        self.best_score = val_loss
-                    
-                    # Update progress bar
-                    self.pbar.set_postfix({
-                        'train_loss': f'{train_loss:.4f}' if train_loss else 'N/A',
-                        'val_loss': f'{val_loss:.4f}',
-                        'best_val': f'{self.best_score:.4f}'
-                    })
-            
+                # LightGBM returns tuples of (dataset_name, metric_name, value, is_higher_better)
+                for item in eval_result:
+                    if len(item) >= 3:
+                        dataset_name, metric_name, value = item[0], item[1], item[2]
+                        if dataset_name == 'train':
+                            train_loss = value
+                        elif dataset_name == 'valid':
+                            val_loss = value
+
+            if val_loss is not None and val_loss < self.best_score:
+                self.best_score = val_loss
+
+            # Update progress bar
+            postfix = {}
+            if train_loss is not None:
+                postfix['train'] = f'{train_loss:.4f}'
+            if val_loss is not None:
+                postfix['val'] = f'{val_loss:.4f}'
+            if self.best_score < float('inf'):
+                postfix['best'] = f'{self.best_score:.4f}'
+
+            self.pbar.set_postfix(postfix)
             self.pbar.n = current_iter
             self.pbar.refresh()
-            
+
         def close(self):
             self.pbar.close()
     
@@ -107,8 +112,9 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         params,
         train_data,
         valid_sets=[train_data, val_data],
+        valid_names=['train', 'valid'],
         num_boost_round=total_iterations,
-        callbacks=callbacks + [lgb.log_evaluation(period=0)]  # period=0 suppresses output
+        callbacks=callbacks + [progress_callback]
     )
     
     progress_callback.close()
