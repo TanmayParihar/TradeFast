@@ -250,10 +250,27 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     
     # Ensure output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Convert to float32 to save memory
+
+    # Convert to float32 and handle NaN/Inf
     X_train = X_train.astype(np.float32)
     X_val = X_val.astype(np.float32)
+
+    # Replace NaN and Inf with 0
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Standardize features (critical for neural networks!)
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    # Clip extreme values after standardization
+    X_train = np.clip(X_train, -10, 10)
+    X_val = np.clip(X_val, -10, 10)
+
+    logger.info(f"Data stats after preprocessing - Train: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
+    logger.info(f"Data stats after preprocessing - Val: mean={X_val.mean():.4f}, std={X_val.std():.4f}")
     
     # Define Dataset class
     class SequenceDataset(Dataset):
@@ -549,16 +566,20 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     
     # Save final model
     torch.save(model.state_dict(), output_path / "mamba_final.pt")
-    
+
+    # Save scaler for inference
+    import joblib
+    joblib.dump(scaler, output_path / "mamba_scaler.joblib")
+
     # Save training history
     history_df = pd.DataFrame(train_history)
     history_path = output_path / "mamba_history.csv"
     history_df.to_csv(history_path, index=False)
-    
+
     logger.info(f"Mamba model saved to {output_path}")
     logger.info(f"Best validation loss: {best_val_loss:.4f}")
     logger.info(f"Final validation accuracy: {val_accuracy:.4f}")
-    
+
     return model
 
 
@@ -577,9 +598,26 @@ def train_tft(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     # Ensure output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Convert to float32
+    # Convert to float32 and handle NaN/Inf
     X_train = X_train.astype(np.float32)
     X_val = X_val.astype(np.float32)
+
+    # Replace NaN and Inf with 0
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Standardize features (critical for neural networks!)
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    # Clip extreme values after standardization
+    X_train = np.clip(X_train, -10, 10)
+    X_val = np.clip(X_val, -10, 10)
+
+    logger.info(f"Data stats after preprocessing - Train: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
+    logger.info(f"Data stats after preprocessing - Val: mean={X_val.mean():.4f}, std={X_val.std():.4f}")
 
     # Define Dataset class for sequences
     class SequenceDataset(Dataset):
@@ -837,6 +875,10 @@ def train_tft(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
 
     # Save final model
     torch.save(model.state_dict(), output_path / "tft_final.pt")
+
+    # Save scaler for inference
+    import joblib
+    joblib.dump(scaler, output_path / "tft_scaler.joblib")
 
     # Save training history
     history_df = pd.DataFrame(train_history)
