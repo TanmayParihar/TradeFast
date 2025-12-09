@@ -10,26 +10,152 @@ from loguru import logger
 app = typer.Typer()
 
 
-@app.command()
-def main(
+@app.command("ohlcv")
+def collect_ohlcv_cmd(
     config: str = typer.Option("config/base.yaml", help="Config file path"),
     symbols: str = typer.Option(None, help="Comma-separated symbols"),
     start_date: str = typer.Option(None, help="Start date (YYYY-MM-DD)"),
     end_date: str = typer.Option(None, help="End date (YYYY-MM-DD)"),
-    data_type: str = typer.Option("all", help="Data type: ohlcv, futures, sentiment, all"),
 ):
-    """Collect market data from various sources."""
+    """Collect OHLCV price data from Binance."""
     from src.utils.config import load_config
     from src.utils.logging import setup_logging
     from src.data.storage import ParquetStore
+    from src.data.ingestion import BinanceOHLCVCollector
 
-    # Load config
     cfg = load_config(config)
     setup_logging(cfg.get("system", {}).get("log_level", "INFO"))
 
-    # Parse parameters
     symbol_list = symbols.split(",") if symbols else cfg["data"]["symbols"]
+    start, end = _parse_dates(start_date, end_date)
 
+    logger.info(f"Collecting OHLCV data for {symbol_list}")
+    store = ParquetStore(cfg["data"]["storage"]["raw_path"])
+
+    async def collect():
+        collector = BinanceOHLCVCollector()
+        results = await collector.fetch_multiple(symbol_list, start, end)
+        for symbol, df in results.items():
+            store.save(df, "ohlcv", symbol)
+            logger.info(f"Saved {len(df)} OHLCV rows for {symbol}")
+
+    asyncio.run(collect())
+    logger.info("OHLCV collection complete")
+
+
+@app.command("futures")
+def collect_futures_cmd(
+    config: str = typer.Option("config/base.yaml", help="Config file path"),
+    symbols: str = typer.Option(None, help="Comma-separated symbols"),
+    start_date: str = typer.Option(None, help="Start date (YYYY-MM-DD)"),
+    end_date: str = typer.Option(None, help="End date (YYYY-MM-DD)"),
+):
+    """Collect futures metrics (funding rate, OI, L/S ratio) from Binance."""
+    from src.utils.config import load_config
+    from src.utils.logging import setup_logging
+    from src.data.storage import ParquetStore
+    from src.data.ingestion import BinanceFuturesCollector
+
+    cfg = load_config(config)
+    setup_logging(cfg.get("system", {}).get("log_level", "INFO"))
+
+    symbol_list = symbols.split(",") if symbols else cfg["data"]["symbols"]
+    start, end = _parse_dates(start_date, end_date)
+
+    logger.info(f"Collecting futures data for {symbol_list}")
+    store = ParquetStore(cfg["data"]["storage"]["raw_path"])
+
+    async def collect():
+        collector = BinanceFuturesCollector()
+        results = await collector.fetch_multiple(symbol_list, start, end)
+        for symbol, df in results.items():
+            store.save(df, "futures", symbol)
+            logger.info(f"Saved {len(df)} futures rows for {symbol}")
+
+    asyncio.run(collect())
+    logger.info("Futures collection complete")
+
+
+@app.command("sentiment")
+def collect_sentiment_cmd(
+    config: str = typer.Option("config/base.yaml", help="Config file path"),
+    days: int = typer.Option(365, help="Number of days to fetch"),
+):
+    """Collect sentiment data (Fear & Greed Index)."""
+    from src.utils.config import load_config
+    from src.utils.logging import setup_logging
+    from src.data.storage import ParquetStore
+    from src.data.ingestion import FearGreedCollector
+
+    cfg = load_config(config)
+    setup_logging(cfg.get("system", {}).get("log_level", "INFO"))
+
+    logger.info(f"Collecting Fear & Greed Index for {days} days")
+    store = ParquetStore(cfg["data"]["storage"]["raw_path"])
+
+    async def collect():
+        collector = FearGreedCollector()
+        fg_df = await collector.fetch(limit=days)
+        store.save(fg_df, "sentiment/fear_greed")
+        logger.info(f"Saved {len(fg_df)} Fear & Greed rows")
+
+    asyncio.run(collect())
+    logger.info("Sentiment collection complete")
+
+
+@app.command("all")
+def collect_all_cmd(
+    config: str = typer.Option("config/base.yaml", help="Config file path"),
+    symbols: str = typer.Option(None, help="Comma-separated symbols"),
+    start_date: str = typer.Option(None, help="Start date (YYYY-MM-DD)"),
+    end_date: str = typer.Option(None, help="End date (YYYY-MM-DD)"),
+):
+    """Collect all data types (OHLCV, futures, sentiment)."""
+    from src.utils.config import load_config
+    from src.utils.logging import setup_logging
+    from src.data.storage import ParquetStore
+    from src.data.ingestion import (
+        BinanceOHLCVCollector,
+        BinanceFuturesCollector,
+        FearGreedCollector,
+    )
+
+    cfg = load_config(config)
+    setup_logging(cfg.get("system", {}).get("log_level", "INFO"))
+
+    symbol_list = symbols.split(",") if symbols else cfg["data"]["symbols"]
+    start, end = _parse_dates(start_date, end_date)
+
+    logger.info(f"Collecting all data for {symbol_list}")
+    store = ParquetStore(cfg["data"]["storage"]["raw_path"])
+
+    async def collect():
+        # OHLCV
+        ohlcv_collector = BinanceOHLCVCollector()
+        ohlcv_results = await ohlcv_collector.fetch_multiple(symbol_list, start, end)
+        for symbol, df in ohlcv_results.items():
+            store.save(df, "ohlcv", symbol)
+            logger.info(f"Saved {len(df)} OHLCV rows for {symbol}")
+
+        # Futures
+        futures_collector = BinanceFuturesCollector()
+        futures_results = await futures_collector.fetch_multiple(symbol_list, start, end)
+        for symbol, df in futures_results.items():
+            store.save(df, "futures", symbol)
+            logger.info(f"Saved {len(df)} futures rows for {symbol}")
+
+        # Sentiment
+        fg_collector = FearGreedCollector()
+        fg_df = await fg_collector.fetch(limit=365)
+        store.save(fg_df, "sentiment/fear_greed")
+        logger.info(f"Saved {len(fg_df)} Fear & Greed rows")
+
+    asyncio.run(collect())
+    logger.info("All data collection complete")
+
+
+def _parse_dates(start_date: str | None, end_date: str | None) -> tuple[datetime, datetime]:
+    """Parse date strings to datetime objects."""
     if start_date:
         start = datetime.strptime(start_date, "%Y-%m-%d")
     else:
@@ -40,57 +166,7 @@ def main(
     else:
         end = datetime.now()
 
-    logger.info(f"Collecting {data_type} data for {symbol_list} from {start} to {end}")
-
-    # Initialize storage
-    store = ParquetStore(cfg["data"]["storage"]["raw_path"])
-
-    async def collect():
-        if data_type in ["ohlcv", "all"]:
-            await collect_ohlcv(symbol_list, start, end, store)
-
-        if data_type in ["futures", "all"]:
-            await collect_futures(symbol_list, start, end, store)
-
-        if data_type in ["sentiment", "all"]:
-            await collect_sentiment(symbol_list, store)
-
-    asyncio.run(collect())
-    logger.info("Data collection complete")
-
-
-async def collect_ohlcv(symbols, start, end, store):
-    """Collect OHLCV data."""
-    from src.data.ingestion import BinanceOHLCVCollector
-
-    collector = BinanceOHLCVCollector()
-    results = await collector.fetch_multiple(symbols, start, end)
-
-    for symbol, df in results.items():
-        store.save(df, "ohlcv", symbol)
-        logger.info(f"Saved {len(df)} OHLCV rows for {symbol}")
-
-
-async def collect_futures(symbols, start, end, store):
-    """Collect futures metrics."""
-    from src.data.ingestion import BinanceFuturesCollector
-
-    collector = BinanceFuturesCollector()
-    results = await collector.fetch_multiple(symbols, start, end)
-
-    for symbol, df in results.items():
-        store.save(df, "futures", symbol)
-        logger.info(f"Saved {len(df)} futures rows for {symbol}")
-
-
-async def collect_sentiment(symbols, store):
-    """Collect sentiment data."""
-    from src.data.ingestion import FearGreedCollector
-
-    fg_collector = FearGreedCollector()
-    fg_df = await fg_collector.fetch(limit=365)
-    store.save(fg_df, "sentiment/fear_greed")
-    logger.info(f"Saved {len(fg_df)} Fear & Greed rows")
+    return start, end
 
 
 if __name__ == "__main__":
