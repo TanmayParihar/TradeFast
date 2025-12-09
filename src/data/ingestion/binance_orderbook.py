@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 import polars as pl
@@ -162,7 +162,7 @@ class BinanceOrderBookCollector(DataSource):
 
     async def start_streaming(
         self,
-        callback: callable | None = None,
+        callback: Callable | None = None,
         snapshot_interval: int = 60,
     ) -> None:
         """
