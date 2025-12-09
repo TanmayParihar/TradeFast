@@ -108,8 +108,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         train_data,
         valid_sets=[train_data, val_data],
         num_boost_round=total_iterations,
-        callbacks=callbacks,
-        verbose_eval=False
+        callbacks=callbacks + [lgb.log_evaluation(period=0)]  # period=0 suppresses output
     )
     
     progress_callback.close()
@@ -210,7 +209,6 @@ def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         num_boost_round=num_rounds,
         evals=watchlist,
         callbacks=[progress_callback],
-        verbose_eval=False,
         early_stopping_rounds=50
     )
     
