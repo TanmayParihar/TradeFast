@@ -641,9 +641,10 @@ def main():
         
         labels = barrier.get_class_labels(df)
         
-        # Prepare features
-        feature_cols = [col for col in df.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'returns']]
-        X = df[feature_cols].values
+        # Prepare features - exclude non-numeric columns
+        exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'returns', 'timestamp', 'symbol', 'date', 'datetime']
+        feature_cols = [col for col in df.columns if col not in exclude_cols and df[col].dtype in ['float64', 'float32', 'int64', 'int32']]
+        X = df[feature_cols].values.astype(np.float32)
         y = labels
         
         # Split data based on timestamp column
