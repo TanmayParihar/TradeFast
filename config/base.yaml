@@ -106,7 +106,7 @@ models:
     dropout: 0.1
     learning_rate: 0.001
     batch_size: 64
-    seq_length: 512
+    seq_length: 64  # 64 minutes (~1 hour) - shorter for faster learning
   lightgbm:
     n_estimators: 500
     num_leaves: 31

@@ -366,15 +366,35 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     logger.info(f"Using device: {device}")
-    
-    # Training setup
+
+    # Calculate class weights for imbalanced data
+    from collections import Counter
+    class_counts = Counter(y_train)
+    total_samples = len(y_train)
+    num_classes = len(class_counts)
+    class_weights = torch.FloatTensor([
+        total_samples / (num_classes * class_counts.get(i, 1))
+        for i in range(num_classes)
+    ]).to(device)
+
+    logger.info(f"Class distribution: {dict(class_counts)}")
+    logger.info(f"Class weights: {class_weights.tolist()}")
+
+    # Training setup with higher initial learning rate
+    initial_lr = model_config["learning_rate"] * 3  # 3x default LR for faster initial learning
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=model_config["learning_rate"],
+        lr=initial_lr,
         weight_decay=cfg["training"]["optimizer"]["weight_decay"]
     )
-    
-    criterion = nn.CrossEntropyLoss()
+
+    # Learning rate scheduler - cosine annealing with warm restarts
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    )
+
+    # Use weighted cross entropy for class imbalance
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     # Training loop with progress bar
     epochs = cfg["training"]["epochs"]
@@ -483,24 +503,29 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         avg_val_loss = val_loss / len(val_loader)
         val_accuracy = val_correct / val_total if val_total > 0 else 0
         
+        # Step learning rate scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
         # Store history
         train_history.append({
             'epoch': epoch,
             'train_loss': avg_train_loss,
             'train_acc': train_accuracy,
             'val_loss': avg_val_loss,
-            'val_acc': val_accuracy
+            'val_acc': val_accuracy,
+            'lr': current_lr
         })
-        
-        # Update epoch progress bar
+
+        # Update epoch progress bar with LR
         epoch_pbar.set_postfix({
-            'train_loss': f'{avg_train_loss:.4f}',
-            'train_acc': f'{train_accuracy:.4f}',
-            'val_loss': f'{avg_val_loss:.4f}',
-            'val_acc': f'{val_accuracy:.4f}',
-            'best_val': f'{best_val_loss:.4f}'
+            'loss': f'{avg_train_loss:.4f}',
+            'acc': f'{train_accuracy:.2%}',
+            'v_loss': f'{avg_val_loss:.4f}',
+            'v_acc': f'{val_accuracy:.2%}',
+            'lr': f'{current_lr:.2e}'
         })
-        
+
         # Early stopping check
         is_best = avg_val_loss < best_val_loss
         if is_best:
