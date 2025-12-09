@@ -8,8 +8,8 @@ from loguru import logger
 app = typer.Typer()
 
 
-@app.command()
-def main(
+@app.command("build")
+def build(
     config: str = typer.Option("config/base.yaml", help="Config file path"),
     symbols: str = typer.Option(None, help="Comma-separated symbols"),
     output_dir: str = typer.Option("data/features", help="Output directory"),
