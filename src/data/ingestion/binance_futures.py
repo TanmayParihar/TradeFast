@@ -134,7 +134,10 @@ class BinanceFuturesCollector(DataSource):
         if start:
             params["startTime"] = int(start.timestamp() * 1000)
         if end:
-            params["endTime"] = int(end.timestamp() * 1000)
+            # Cap end time to current time (API rejects future dates)
+            now = datetime.now(timezone.utc)
+            end_capped = min(end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end, now)
+            params["endTime"] = int(end_capped.timestamp() * 1000)
 
         async with session.get(url, params=params) as response:
             response.raise_for_status()
