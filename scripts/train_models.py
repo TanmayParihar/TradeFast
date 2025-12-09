@@ -641,7 +641,7 @@ def main():
             min_vol=cfg["strategy"]["triple_barrier"]["min_vol"]
         )
         
-        labels = barrier.label(df)
+        labels = barrier.get_class_labels(df)
         
         # Prepare features
         feature_cols = [col for col in df.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'returns']]
