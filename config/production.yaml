@@ -1,0 +1,39 @@
+# Production configuration overrides
+system:
+  log_level: WARNING
+
+data:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+    - SOLUSDT
+    - ADAUSDT
+    - AVAXUSDT
+    - DOGEUSDT
+    - DOTUSDT
+    - MATICUSDT
+    - XRPUSDT
+
+training:
+  mixed_precision: true
+  gradient_checkpointing: true
+
+strategy:
+  position_sizing:
+    kelly_fraction: 0.25
+    max_position_pct: 0.05
+  risk_management:
+    max_drawdown: 0.10
+    daily_var_limit: 0.015
+    max_positions: 3
+
+backtest:
+  leverage: 1
+  costs:
+    vip_level: Regular
+    use_bnb: true
+
+api:
+  binance:
+    testnet: false

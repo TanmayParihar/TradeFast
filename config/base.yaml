@@ -1,0 +1,224 @@
+system:
+  name: crypto_multi_modal_bot
+  version: 1.0.0
+  log_level: INFO
+  timezone: UTC
+  seed: 42
+
+data:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+    - SOLUSDT
+    - ADAUSDT
+    - AVAXUSDT
+    - DOGEUSDT
+    - DOTUSDT
+    - MATICUSDT
+    - XRPUSDT
+  timeframe: "1m"
+  train_period:
+    start: "2016-01-01"
+    end: "2023-12-31"
+  test_period:
+    start: "2024-01-01"
+    end: "2024-12-31"
+  validation_period:
+    start: "2025-01-01"
+    end: "2025-12-31"
+  storage:
+    type: parquet
+    path: data/processed
+    raw_path: data/raw
+    interim_path: data/interim
+    features_path: data/features
+    cache_path: data/cache
+
+features:
+  technical:
+    sma:
+      windows: [10, 20, 50, 200]
+    ema:
+      windows: [10, 20, 50]
+    rsi:
+      period: 14
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+    bbands:
+      period: 20
+      std: 2
+    atr:
+      period: 14
+    stoch:
+      k_period: 14
+      d_period: 3
+    adx:
+      period: 14
+    obv: {}
+    vwap: {}
+  orderbook:
+    - bid_ask_spread
+    - bid_ask_imbalance
+    - depth_imbalance
+    - volume_weighted_price
+    - order_flow_imbalance
+    - microprice
+  onchain:
+    - funding_rate
+    - open_interest_change
+    - long_short_ratio
+    - top_trader_ls_ratio
+    - taker_buy_sell_ratio
+  sentiment:
+    - fear_greed_index
+    - news_sentiment_score
+    - reddit_sentiment
+  temporal:
+    - hour_sin
+    - hour_cos
+    - day_of_week_sin
+    - day_of_week_cos
+    - month_sin
+    - month_cos
+
+models:
+  tft:
+    hidden_size: 32
+    attention_head_size: 4
+    dropout: 0.2
+    hidden_continuous_size: 16
+    lstm_layers: 2
+    output_size: 7
+    learning_rate: 0.003
+    encoder_length: 168
+    prediction_length: 15
+    batch_size: 32
+    gradient_checkpointing: true
+  mamba:
+    d_model: 64
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    n_layers: 4
+    dropout: 0.1
+    learning_rate: 0.001
+    batch_size: 64
+    seq_length: 512
+  lightgbm:
+    n_estimators: 500
+    num_leaves: 31
+    learning_rate: 0.05
+    max_depth: 8
+    min_child_samples: 20
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+  xgboost:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    min_child_weight: 3
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+  ensemble:
+    meta_learner: neural_network
+    meta_hidden_size: 32
+    meta_dropout: 0.3
+    use_confidence_weighting: true
+
+training:
+  epochs: 100
+  early_stopping_patience: 10
+  gradient_clip: 1.0
+  mixed_precision: true
+  gradient_checkpointing: true
+  accumulate_grad_batches: 1
+  checkpoint_dir: checkpoints
+  cv:
+    n_splits: 5
+    embargo_pct: 0.02
+    purge_gap: 168
+  optimizer:
+    name: AdamW
+    weight_decay: 0.01
+  scheduler:
+    name: CosineAnnealingWarmRestarts
+    T_0: 10
+    T_mult: 2
+    eta_min: 1e-6
+
+strategy:
+  triple_barrier:
+    pt_mult: 2.0
+    sl_mult: 1.0
+    max_holding: 240
+    vol_span: 1440
+    min_vol: 0.0001
+  position_sizing:
+    method: kelly
+    kelly_fraction: 0.5
+    max_position_pct: 0.1
+    min_position_pct: 0.01
+  signal:
+    min_confidence: 0.6
+    ensemble_method: weighted_average
+    direction_threshold: 0.55
+  risk_management:
+    max_drawdown: 0.15
+    daily_var_limit: 0.02
+    max_correlation: 0.7
+    max_positions: 5
+    position_timeout: 480
+
+backtest:
+  initial_capital: 100000
+  leverage: 1
+  costs:
+    vip_level: Regular
+    use_bnb: true
+    slippage_bps: 1.0
+    funding_rate: 0.0001
+  walk_forward:
+    train_bars: 525600
+    test_bars: 131400
+    n_splits: 8
+    target: sharpe
+  metrics:
+    - sharpe
+    - sortino
+    - calmar
+    - max_drawdown
+    - win_rate
+    - profit_factor
+
+hardware:
+  gpu:
+    device: cuda
+    precision: "16-mixed"
+    memory_fraction: 0.9
+  cpu:
+    num_workers: 8
+    joblib_jobs: 6
+    pin_memory: true
+    prefetch_factor: 2
+
+api:
+  binance:
+    base_url: "https://fapi.binance.com"
+    ws_url: "wss://fstream.binance.com"
+    testnet_base_url: "https://testnet.binancefuture.com"
+    testnet_ws_url: "wss://stream.binancefuture.com"
+    rate_limit: 1200
+    weight_limit: 2400
+  cryptopanic:
+    base_url: "https://cryptopanic.com/api/v1"
+  fear_greed:
+    base_url: "https://api.alternative.me/fng"
+  defillama:
+    base_url: "https://api.llama.fi"

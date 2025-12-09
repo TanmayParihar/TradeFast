@@ -1,0 +1,83 @@
+# Temporal Fusion Transformer Configuration
+# Optimized for 8GB VRAM (RTX 4070)
+
+model:
+  name: temporal_fusion_transformer
+  type: pytorch_forecasting
+
+architecture:
+  hidden_size: 32
+  attention_head_size: 4
+  dropout: 0.2
+  hidden_continuous_size: 16
+  lstm_layers: 2
+  output_size: 7
+
+input:
+  encoder_length: 168
+  prediction_length: 15
+  min_encoder_length: 60
+  min_prediction_length: 1
+
+time_varying_known:
+  - hour
+  - minute
+  - day_of_week
+  - month
+  - hour_sin
+  - hour_cos
+  - day_of_week_sin
+  - day_of_week_cos
+
+time_varying_unknown:
+  - open
+  - high
+  - low
+  - close
+  - volume
+  - returns
+  - rsi
+  - macd
+  - macd_signal
+  - bb_upper
+  - bb_lower
+  - bb_mid
+  - atr
+  - funding_rate
+  - open_interest_change
+  - long_short_ratio
+
+static_categoricals:
+  - symbol
+
+training:
+  learning_rate: 0.003
+  batch_size: 32
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  gradient_checkpointing: true
+  accumulate_grad_batches: 1
+
+loss:
+  type: quantile
+  quantiles: [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
+
+optimizer:
+  name: AdamW
+  weight_decay: 0.01
+
+scheduler:
+  name: ReduceLROnPlateau
+  mode: min
+  factor: 0.5
+  patience: 5
+  min_lr: 1e-6
+
+normalization:
+  target: GroupNormalizer
+  method: standard
+  center: true
+
+interpretation:
+  log_attention_weights: true
+  log_gradient_flow: false

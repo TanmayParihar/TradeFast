@@ -1,0 +1,133 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crypto-trading-bot"
+version = "1.0.0"
+description = "Multi-modal hybrid architecture for cryptocurrency algorithmic trading"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["trading", "cryptocurrency", "machine-learning", "deep-learning"]
+authors = [
+    { name = "TradeFast Team" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Core ML
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "torchaudio>=2.2.0",
+
+    # Transformers & LLM
+    "transformers>=4.40.0",
+    "accelerate>=0.29.0",
+    "bitsandbytes>=0.43.0",
+
+    # Time Series
+    "pytorch-forecasting>=1.0.0",
+    "pytorch-lightning>=2.2.0",
+
+    # Tree-based Models
+    "lightgbm>=4.3.0",
+    "xgboost>=2.0.0",
+    "scikit-learn>=1.4.0",
+
+    # Data Processing
+    "polars>=0.20.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "pyarrow>=15.0.0",
+    "duckdb>=0.10.0",
+
+    # Feature Engineering
+    "numba>=0.59.0",
+    "scipy>=1.12.0",
+
+    # Optimization
+    "optuna>=3.6.0",
+    "mlflow>=2.11.0",
+
+    # API & Data Collection
+    "ccxt>=4.2.0",
+    "python-binance>=1.0.19",
+    "websockets>=12.0",
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    "praw>=7.7.0",
+
+    # Backtesting
+    "vectorbt>=0.26.0",
+
+    # Utilities
+    "pyyaml>=6.0.1",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.0",
+    "loguru>=0.7.0",
+    "joblib>=1.4.0",
+    "omegaconf>=2.3.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.1.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+    "pre-commit>=3.6.0",
+]
+
+mamba = [
+    "mamba-ssm>=1.2.0",
+    "causal-conv1d>=1.1.0",
+]
+
+flash = [
+    "flash-attn>=2.5.0",
+]
+
+[project.scripts]
+collect-data = "scripts.collect_data:main"
+build-features = "scripts.build_features:main"
+train-models = "scripts.train_models:main"
+run-backtest = "scripts.run_backtest:main"
+live-trading = "scripts.live_trading:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+include = '\.pyi?$'
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

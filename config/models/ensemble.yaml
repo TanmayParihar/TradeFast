@@ -1,0 +1,60 @@
+# Ensemble Stacking Configuration
+
+ensemble:
+  name: stacked_trading_ensemble
+  type: stacking
+
+base_models:
+  tft:
+    enabled: true
+    weight: 0.3
+    config: config/models/tft.yaml
+  mamba:
+    enabled: true
+    weight: 0.3
+    config: config/models/mamba.yaml
+  lightgbm:
+    enabled: true
+    weight: 0.2
+    config: config/models/lightgbm.yaml
+  xgboost:
+    enabled: true
+    weight: 0.2
+    config: config/models/xgboost.yaml
+
+meta_learner:
+  type: neural_network
+  architecture:
+    input_size: 4
+    hidden_layers: [32, 16]
+    output_size: 3
+    dropout: 0.3
+    batch_norm: true
+    activation: relu
+
+training:
+  learning_rate: 0.001
+  batch_size: 128
+  max_epochs: 50
+  early_stopping_patience: 10
+
+cross_validation:
+  method: purged_kfold
+  n_splits: 5
+  embargo_pct: 0.02
+
+blending:
+  method: weighted_average
+  optimize_weights: true
+  min_weight: 0.05
+  use_oof_predictions: true
+
+confidence:
+  use_confidence_weighting: true
+  confidence_threshold: 0.6
+  temperature: 1.0
+
+output:
+  predict_proba: true
+  return_base_predictions: false
+  return_confidence: true

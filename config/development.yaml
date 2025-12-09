@@ -1,0 +1,32 @@
+# Development configuration overrides
+system:
+  log_level: DEBUG
+
+data:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  train_period:
+    start: "2023-01-01"
+    end: "2023-12-31"
+  test_period:
+    start: "2024-01-01"
+    end: "2024-06-30"
+
+training:
+  epochs: 10
+  early_stopping_patience: 3
+  cv:
+    n_splits: 3
+
+backtest:
+  initial_capital: 10000
+  walk_forward:
+    n_splits: 3
+    train_bars: 131400
+    test_bars: 43800
+
+hardware:
+  cpu:
+    num_workers: 4
+    joblib_jobs: 2

@@ -1,0 +1,49 @@
+# XGBoost Configuration
+
+model:
+  name: xgboost_classifier
+  type: xgboost
+  objective: multi:softproba
+  num_class: 3
+  eval_metric: mlogloss
+
+boosting:
+  booster: gbtree
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.05
+
+regularization:
+  min_child_weight: 3
+  gamma: 0.0
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  max_delta_step: 0
+
+sampling:
+  subsample: 0.8
+  colsample_bytree: 0.8
+  colsample_bylevel: 1.0
+  colsample_bynode: 1.0
+
+early_stopping:
+  early_stopping_rounds: 50
+  verbose_eval: 100
+
+tree_method:
+  tree_method: hist
+  max_bin: 256
+  grow_policy: depthwise
+
+hardware:
+  n_jobs: -1
+  device: cpu
+  predictor: auto
+
+output:
+  predict_proba: true
+  importance_type: gain
+
+random:
+  seed: 42
+  deterministic_histogram: true

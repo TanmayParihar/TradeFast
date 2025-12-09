@@ -1,0 +1,52 @@
+# LightGBM Configuration
+
+model:
+  name: lightgbm_classifier
+  type: lightgbm
+  objective: multiclass
+  num_class: 3
+  metric: multi_logloss
+
+boosting:
+  boosting_type: gbdt
+  n_estimators: 500
+  num_leaves: 31
+  max_depth: 8
+  learning_rate: 0.05
+
+regularization:
+  min_child_samples: 20
+  min_child_weight: 0.001
+  min_split_gain: 0.0
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+
+sampling:
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  bagging_seed: 42
+
+early_stopping:
+  early_stopping_rounds: 50
+  verbose_eval: 100
+
+optimization:
+  feature_fraction: 0.8
+  feature_fraction_bynode: 0.8
+  max_bin: 255
+  min_data_in_bin: 5
+
+hardware:
+  n_jobs: -1
+  device: cpu
+  gpu_use_dp: false
+
+categorical:
+  categorical_feature: auto
+  cat_l2: 10.0
+  cat_smooth: 10.0
+
+output:
+  predict_proba: true
+  importance_type: gain
