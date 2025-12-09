@@ -7,7 +7,6 @@ system:
 
 data:
   symbols:
-    - BTCUSDT
     - ETHUSDT
     - BNBUSDT
     - SOLUSDT
@@ -15,7 +14,6 @@ data:
     - AVAXUSDT
     - DOGEUSDT
     - DOTUSDT
-    - MATICUSDT
     - XRPUSDT
   timeframe: "1m"
   train_period:
@@ -30,10 +28,12 @@ data:
   storage:
     type: parquet
     path: data/processed
-    raw_path: data/raw
+    raw_path: "/media/tanmay-parihar/T7 Shield/TradeFast/raw"
     interim_path: data/interim
     features_path: data/features
     cache_path: data/cache
+  # File naming pattern: ohlcv_{BASE}_{QUOTE}.parquet (e.g., ohlcv_ETH_USDT.parquet)
+  file_pattern: "ohlcv_{base}_{quote}.parquet"
 
 features:
   technical:
