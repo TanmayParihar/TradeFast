@@ -648,9 +648,16 @@ def main():
         X = df[feature_cols].values
         y = labels
         
-        # Split data
-        train_mask = df.index < cfg["data"]["validation_period"]["start"]
-        valid_mask = df.index >= cfg["data"]["validation_period"]["start"]
+        # Split data based on timestamp column
+        val_start = pd.to_datetime(cfg["data"]["validation_period"]["start"])
+        if "timestamp" in df.columns:
+            train_mask = df["timestamp"] < val_start
+            valid_mask = df["timestamp"] >= val_start
+        else:
+            # Fallback to percentage split if no timestamp
+            split_idx = int(len(df) * 0.8)
+            train_mask = np.arange(len(df)) < split_idx
+            valid_mask = np.arange(len(df)) >= split_idx
         
         X_train = X[train_mask]
         y_train = y[train_mask]
