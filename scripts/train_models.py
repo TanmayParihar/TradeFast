@@ -65,7 +65,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     class ProgressCallback:
         def __init__(self, total_iterations):
             self.pbar = tqdm(total=total_iterations, desc=f"{symbol} - LightGBM",
-                           unit="iter", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+                           unit="iter", ncols=120)
             self.best_score = float('inf')
 
         def __call__(self, env):
@@ -88,17 +88,14 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
             if val_loss is not None and val_loss < self.best_score:
                 self.best_score = val_loss
 
-            # Update progress bar
-            postfix = {}
-            if train_loss is not None:
-                postfix['train'] = f'{train_loss:.4f}'
-            if val_loss is not None:
-                postfix['val'] = f'{val_loss:.4f}'
-            if self.best_score < float('inf'):
-                postfix['best'] = f'{self.best_score:.4f}'
-
-            self.pbar.set_postfix(postfix)
+            # Update progress bar with metrics
             self.pbar.n = current_iter
+            self.pbar.set_postfix(
+                train=f'{train_loss:.4f}' if train_loss else '?',
+                val=f'{val_loss:.4f}' if val_loss else '?',
+                best=f'{self.best_score:.4f}' if self.best_score < float('inf') else '?',
+                refresh=False
+            )
             self.pbar.refresh()
 
         def close(self):
@@ -170,37 +167,37 @@ def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
             self.pbar = None
             self.best_score = float('inf')
             self.history = {'train': [], 'eval': []}
-            
+
         def after_iteration(self, model, epoch, evals_log):
             if self.pbar is None:
                 self.pbar = tqdm(total=num_rounds, desc=f"{self.symbol} - XGBoost",
-                               unit="iter", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-            
+                               unit="iter", ncols=120)
+
             # Get latest metrics
             train_loss = evals_log['train']['mlogloss'][-1] if 'train' in evals_log else None
             eval_loss = evals_log['eval']['mlogloss'][-1] if 'eval' in evals_log else None
-            
+
             if eval_loss is not None and eval_loss < self.best_score:
                 self.best_score = eval_loss
-            
+
             # Update progress bar
-            self.pbar.set_postfix({
-                'train_loss': f'{train_loss:.4f}' if train_loss else 'N/A',
-                'val_loss': f'{eval_loss:.4f}' if eval_loss else 'N/A',
-                'best_val': f'{self.best_score:.4f}'
-            })
-            
-            self.pbar.update(1)
+            self.pbar.n = epoch + 1
+            self.pbar.set_postfix(
+                train=f'{train_loss:.4f}' if train_loss else '?',
+                val=f'{eval_loss:.4f}' if eval_loss else '?',
+                best=f'{self.best_score:.4f}' if self.best_score < float('inf') else '?',
+                refresh=False
+            )
             self.pbar.refresh()
-            
+
             # Store history
             if train_loss:
                 self.history['train'].append(train_loss)
             if eval_loss:
                 self.history['eval'].append(eval_loss)
-            
+
             return False  # Continue training
-            
+
         def after_training(self, model):
             if self.pbar:
                 self.pbar.close()
@@ -208,14 +205,18 @@ def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     
     # Train model
     progress_callback = XGBProgressCallback(symbol)
-    
+
+    # Use callbacks for early stopping and suppress default logging
     bst = xgb.train(
         params,
         dtrain,
         num_boost_round=num_rounds,
         evals=watchlist,
-        callbacks=[progress_callback],
-        early_stopping_rounds=50
+        callbacks=[
+            progress_callback,
+            xgb.callback.EarlyStopping(rounds=50, save_best=True),
+        ],
+        verbose_eval=False  # Suppress default logging
     )
     
     # Save model
