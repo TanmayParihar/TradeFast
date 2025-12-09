@@ -362,16 +362,35 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     # Training loop with progress bar
     epochs = cfg["training"]["epochs"]
     best_val_loss = float('inf')
+    best_val_acc = 0.0
     patience_counter = 0
     early_stopping_patience = cfg["training"]["early_stopping_patience"]
-    
+    checkpoint_every = 5  # Save checkpoint every N epochs
+    start_epoch = 0
+
+    # Create checkpoint directory
+    checkpoint_dir = output_path / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for existing checkpoint to resume from
+    resume_checkpoint = checkpoint_dir / "latest_checkpoint.pt"
+    if resume_checkpoint.exists():
+        logger.info(f"Found checkpoint, resuming training...")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        best_val_acc = checkpoint.get('best_val_acc', 0.0)
+        logger.info(f"Resumed from epoch {start_epoch}, best_val_loss: {best_val_loss:.4f}")
+
     # Training statistics
     train_history = []
     val_history = []
-    
-    # Create main progress bar for epochs
-    epoch_pbar = tqdm(range(epochs), desc=f"{symbol} - Mamba", 
-                     unit="epoch", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+
+    # Create main progress bar for epochs - use ncols to show stats properly
+    epoch_pbar = tqdm(range(start_epoch, epochs), desc=f"{symbol} - Mamba",
+                     unit="epoch", ncols=140, initial=start_epoch, total=epochs)
     
     for epoch in epoch_pbar:
         # Training
@@ -381,9 +400,8 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         train_total = 0
         
         # Batch progress bar
-        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Training", 
-                         leave=False, unit="batch", 
-                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+        batch_pbar = tqdm(train_loader, desc=f"  Train",
+                         leave=False, unit="batch", ncols=100)
         
         for batch_X, batch_y in batch_pbar:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
@@ -424,9 +442,8 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         val_total = 0
         
         with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1} Validation", 
-                           leave=False, unit="batch",
-                           bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+            val_pbar = tqdm(val_loader, desc=f"  Valid",
+                           leave=False, unit="batch", ncols=100)
             
             for batch_X, batch_y in val_pbar:
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
@@ -467,9 +484,11 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
             'best_val': f'{best_val_loss:.4f}'
         })
         
-        # Early stopping
-        if avg_val_loss < best_val_loss:
+        # Early stopping check
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
             best_val_loss = avg_val_loss
+            best_val_acc = val_accuracy
             patience_counter = 0
             # Save best model
             torch.save({
@@ -478,16 +497,53 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': avg_val_loss,
                 'val_accuracy': val_accuracy,
+                'best_val_loss': best_val_loss,
+                'best_val_acc': best_val_acc,
                 'history': train_history,
                 'config': model_config
             }, output_path / "mamba_best.pt")
-            epoch_pbar.set_description(f"{symbol} - Mamba (Best: {best_val_loss:.4f})")
+            epoch_pbar.set_description(f"{symbol} - Mamba ★")
         else:
             patience_counter += 1
-            if patience_counter >= early_stopping_patience:
-                logger.info(f"Early stopping at epoch {epoch+1}")
-                epoch_pbar.set_description(f"{symbol} - Mamba (Early Stop)")
-                break
+
+        # Save periodic checkpoint every N epochs
+        if (epoch + 1) % checkpoint_every == 0 or epoch == start_epoch:
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': avg_val_loss,
+                'val_accuracy': val_accuracy,
+                'best_val_loss': best_val_loss,
+                'best_val_acc': best_val_acc,
+                'train_loss': avg_train_loss,
+                'train_accuracy': train_accuracy,
+                'history': train_history,
+                'config': model_config,
+                'patience_counter': patience_counter
+            }, checkpoint_path)
+            # Also save as latest for resume
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': avg_val_loss,
+                'val_accuracy': val_accuracy,
+                'best_val_loss': best_val_loss,
+                'best_val_acc': best_val_acc,
+                'train_loss': avg_train_loss,
+                'train_accuracy': train_accuracy,
+                'history': train_history,
+                'config': model_config,
+                'patience_counter': patience_counter
+            }, checkpoint_dir / "latest_checkpoint.pt")
+
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            logger.info(f"Early stopping at epoch {epoch+1}")
+            epoch_pbar.set_description(f"{symbol} - Mamba (Early Stop)")
+            break
     
     epoch_pbar.close()
     
@@ -507,20 +563,290 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
 
 
 def train_tft(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train Temporal Fusion Transformer with progress bar"""
+    """Train Temporal Fusion Transformer with progress bar and checkpointing"""
     import torch
     import torch.nn as nn
     import numpy as np
     import logging
+    from torch.utils.data import DataLoader, Dataset
     from tqdm import tqdm
-    
+
     logger = logging.getLogger(__name__)
     logger.info(f"Training TFT for {symbol}")
-    
-    # TODO: Implement TFT training
-    logger.warning("TFT training not implemented yet")
-    
-    return None
+
+    # Ensure output directory exists
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Convert to float32
+    X_train = X_train.astype(np.float32)
+    X_val = X_val.astype(np.float32)
+
+    # Define Dataset class for sequences
+    class SequenceDataset(Dataset):
+        def __init__(self, X, y, seq_len):
+            self.X = X
+            self.y = y
+            self.seq_len = seq_len
+
+        def __len__(self):
+            return len(self.X) - self.seq_len
+
+        def __getitem__(self, idx):
+            return (
+                torch.FloatTensor(self.X[idx:idx+self.seq_len]),
+                torch.LongTensor([self.y[idx+self.seq_len]])
+            )
+
+    # Get sequence length from config
+    seq_len = cfg["models"]["tft"].get("encoder_length", 168)
+
+    # Create datasets
+    train_dataset = SequenceDataset(X_train, y_train, seq_len)
+    val_dataset = SequenceDataset(X_val, y_val, seq_len)
+
+    # Create data loaders
+    batch_size = cfg["models"]["tft"]["batch_size"]
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=min(4, cfg["hardware"]["cpu"]["num_workers"]),
+        pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=min(2, cfg["hardware"]["cpu"]["num_workers"]),
+        pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
+    )
+
+    # Simple TFT-style model (transformer-based)
+    class SimpleTFT(nn.Module):
+        def __init__(self, input_dim, num_classes, hidden_size=32, n_heads=4, n_layers=2, dropout=0.2):
+            super().__init__()
+            self.input_proj = nn.Linear(input_dim, hidden_size)
+
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=n_heads,
+                dim_feedforward=hidden_size * 4,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+            self.pool = nn.AdaptiveAvgPool1d(1)
+            self.dropout = nn.Dropout(dropout)
+            self.classifier = nn.Linear(hidden_size, num_classes)
+
+        def forward(self, x):
+            # x: (batch, seq_len, features)
+            x = self.input_proj(x)
+            x = self.transformer(x)
+            # Pool over sequence dimension
+            x = x.transpose(1, 2)  # (batch, hidden, seq)
+            x = self.pool(x).squeeze(-1)
+            x = self.dropout(x)
+            return self.classifier(x)
+
+    # Initialize model
+    input_dim = X_train.shape[1]
+    num_classes = len(np.unique(y_train))
+
+    model_config = cfg["models"]["tft"]
+    model = SimpleTFT(
+        input_dim=input_dim,
+        num_classes=num_classes,
+        hidden_size=model_config.get("hidden_size", 32),
+        n_heads=model_config.get("attention_head_size", 4),
+        n_layers=model_config.get("lstm_layers", 2),
+        dropout=model_config.get("dropout", 0.2)
+    )
+
+    # Move to GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    logger.info(f"Using device: {device}")
+
+    # Training setup
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=model_config.get("learning_rate", 0.003),
+        weight_decay=cfg["training"]["optimizer"]["weight_decay"]
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    # Training parameters
+    epochs = cfg["training"]["epochs"]
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+    patience_counter = 0
+    early_stopping_patience = cfg["training"]["early_stopping_patience"]
+    checkpoint_every = 5
+    start_epoch = 0
+
+    # Create checkpoint directory
+    checkpoint_dir = output_path / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for existing checkpoint to resume from
+    resume_checkpoint = checkpoint_dir / "tft_latest_checkpoint.pt"
+    if resume_checkpoint.exists():
+        logger.info(f"Found checkpoint, resuming training...")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        best_val_acc = checkpoint.get('best_val_acc', 0.0)
+        logger.info(f"Resumed from epoch {start_epoch}, best_val_loss: {best_val_loss:.4f}")
+
+    # Training history
+    train_history = []
+
+    # Training loop
+    epoch_pbar = tqdm(range(start_epoch, epochs), desc=f"{symbol} - TFT",
+                     unit="epoch", ncols=140, initial=start_epoch, total=epochs)
+
+    for epoch in epoch_pbar:
+        # Training phase
+        model.train()
+        train_loss = 0
+        train_correct = 0
+        train_total = 0
+
+        batch_pbar = tqdm(train_loader, desc=f"  Train", leave=False, unit="batch", ncols=100)
+
+        for batch_X, batch_y in batch_pbar:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
+
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["gradient_clip"])
+            optimizer.step()
+
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            train_total += batch_y.size(0)
+            train_correct += (predicted == batch_y).sum().item()
+
+            batch_pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{train_correct/train_total:.4f}')
+
+        batch_pbar.close()
+        avg_train_loss = train_loss / len(train_loader)
+        train_accuracy = train_correct / train_total if train_total > 0 else 0
+
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"  Valid", leave=False, unit="batch", ncols=100)
+
+            for batch_X, batch_y in val_pbar:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += batch_y.size(0)
+                val_correct += (predicted == batch_y).sum().item()
+
+                val_pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{val_correct/val_total:.4f}')
+
+            val_pbar.close()
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = val_correct / val_total if val_total > 0 else 0
+
+        # Store history
+        train_history.append({
+            'epoch': epoch,
+            'train_loss': avg_train_loss,
+            'train_acc': train_accuracy,
+            'val_loss': avg_val_loss,
+            'val_acc': val_accuracy
+        })
+
+        # Update epoch progress bar
+        epoch_pbar.set_postfix(
+            train_loss=f'{avg_train_loss:.4f}',
+            train_acc=f'{train_accuracy:.4f}',
+            val_loss=f'{avg_val_loss:.4f}',
+            val_acc=f'{val_accuracy:.4f}',
+            best_val=f'{best_val_loss:.4f}'
+        )
+
+        # Early stopping check
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+            best_val_acc = val_accuracy
+            patience_counter = 0
+            # Save best model
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': avg_val_loss,
+                'val_accuracy': val_accuracy,
+                'best_val_loss': best_val_loss,
+                'best_val_acc': best_val_acc,
+                'history': train_history,
+                'config': model_config
+            }, output_path / "tft_best.pt")
+            epoch_pbar.set_description(f"{symbol} - TFT ★")
+        else:
+            patience_counter += 1
+
+        # Save periodic checkpoint
+        if (epoch + 1) % checkpoint_every == 0 or epoch == start_epoch:
+            checkpoint_data = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': avg_val_loss,
+                'val_accuracy': val_accuracy,
+                'best_val_loss': best_val_loss,
+                'best_val_acc': best_val_acc,
+                'train_loss': avg_train_loss,
+                'train_accuracy': train_accuracy,
+                'history': train_history,
+                'config': model_config,
+                'patience_counter': patience_counter
+            }
+            torch.save(checkpoint_data, checkpoint_dir / f"tft_checkpoint_epoch_{epoch+1}.pt")
+            torch.save(checkpoint_data, checkpoint_dir / "tft_latest_checkpoint.pt")
+
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            logger.info(f"Early stopping at epoch {epoch+1}")
+            epoch_pbar.set_description(f"{symbol} - TFT (Early Stop)")
+            break
+
+    epoch_pbar.close()
+
+    # Save final model
+    torch.save(model.state_dict(), output_path / "tft_final.pt")
+
+    # Save training history
+    history_df = pd.DataFrame(train_history)
+    history_df.to_csv(output_path / "tft_history.csv", index=False)
+
+    logger.info(f"TFT model saved to {output_path}")
+    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Final validation accuracy: {val_accuracy:.4f}")
+
+    return model
 
 
 def main():
