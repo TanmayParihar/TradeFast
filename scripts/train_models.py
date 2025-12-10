@@ -1,1470 +1,413 @@
-#!/usr/bin/env python3
-"""
-Train machine learning models for cryptocurrency trading.
-"""
-
-import argparse
-import sys
-from pathlib import Path
-
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root))
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-import pandas as pd
-import logging
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+import wandb
 import warnings
-from tqdm import tqdm
-import time
-from datetime import datetime
-
-# Suppress warnings
 warnings.filterwarnings('ignore')
+from typing import Dict, List, Tuple, Optional
+import math
 
-# Classification metrics imports
-from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
-
-# Import project modules
-from src.utils.config import load_config
-from src.utils.logging import setup_logging
-from src.utils.gpu_utils import setup_gpu_optimizations
-from src.data.storage.parquet_store import ParquetStore
-from src.models.meta_labeling.triple_barrier import TripleBarrier
-from src.models.architectures.lightgbm_model import LightGBMModel
-from src.models.architectures.xgboost_model import XGBoostModel
-
-
-def print_classification_metrics(y_true, y_pred, model_name, symbol, class_names=None):
-    """
-    Print confusion matrix and per-class metrics.
-
-    Args:
-        y_true: True labels
-        y_pred: Predicted labels
-        model_name: Name of the model for display
-        symbol: Trading symbol
-        class_names: Optional list of class names (default: ['Buy', 'Hold', 'Sell'])
-    """
-    logger = logging.getLogger(__name__)
-
-    if class_names is None:
-        class_names = ['Buy', 'Hold', 'Sell']
-
-    # Ensure arrays are numpy
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
-
-    # Get unique classes present
-    unique_classes = np.unique(np.concatenate([y_true, y_pred]))
-    present_class_names = [class_names[i] if i < len(class_names) else f'Class_{i}'
-                          for i in unique_classes]
-
-    print(f"\n{'='*70}")
-    print(f" {model_name} Classification Report - {symbol}")
-    print(f"{'='*70}")
-
-    # Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
-    print(f"\nConfusion Matrix:")
-    print(f"{'':>12}", end='')
-    for name in present_class_names:
-        print(f"{name:>10}", end='')
-    print(" (Predicted)")
-    print("-" * (12 + len(present_class_names) * 10))
-
-    for i, (row, name) in enumerate(zip(cm, present_class_names)):
-        print(f"{name:>10} |", end='')
-        for val in row:
-            print(f"{val:>10}", end='')
-        print()
-    print("(Actual)")
-
-    # Per-class metrics
-    precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, average=None, labels=unique_classes, zero_division=0
-    )
-
-    print(f"\nPer-Class Metrics:")
-    print(f"{'Class':>12} {'Precision':>12} {'Recall':>12} {'F1-Score':>12} {'Support':>10}")
-    print("-" * 60)
-
-    for i, cls_name in enumerate(present_class_names):
-        print(f"{cls_name:>12} {precision[i]:>12.4f} {recall[i]:>12.4f} {f1[i]:>12.4f} {support[i]:>10}")
-
-    # Overall metrics
-    accuracy = np.mean(y_true == y_pred)
-    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average='macro', zero_division=0
-    )
-    weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average='weighted', zero_division=0
-    )
-
-    print("-" * 60)
-    print(f"{'Accuracy':>12} {accuracy:>12.4f}")
-    print(f"{'Macro Avg':>12} {macro_precision:>12.4f} {macro_recall:>12.4f} {macro_f1:>12.4f}")
-    print(f"{'Weighted':>12} {weighted_precision:>12.4f} {weighted_recall:>12.4f} {weighted_f1:>12.4f}")
-    print(f"{'='*70}\n")
-
-    # Log summary
-    logger.info(f"{model_name} {symbol}: Accuracy={accuracy:.4f}, Macro-F1={macro_f1:.4f}, Weighted-F1={weighted_f1:.4f}")
-
-    return {
-        'accuracy': accuracy,
-        'macro_f1': macro_f1,
-        'weighted_f1': weighted_f1,
-        'confusion_matrix': cm.tolist(),
-        'per_class': {
-            'precision': precision.tolist(),
-            'recall': recall.tolist(),
-            'f1': f1.tolist(),
-            'support': support.tolist()
+class ImprovedTrainer:
+    """Enhanced trainer with better validation and early stopping"""
+    
+    def __init__(self, model, cfg, device):
+        self.model = model.to(device)
+        self.cfg = cfg
+        self.device = device
+        
+        # Loss functions
+        self.classification_loss = nn.CrossEntropyLoss(
+            weight=torch.tensor(cfg.class_weights, device=device) if hasattr(cfg, 'class_weights') else None
+        )
+        self.confidence_loss = nn.MSELoss()
+        
+        # Optimizer with gradient clipping
+        self.optimizer = optim.AdamW(
+            model.parameters(),
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
+            betas=(0.9, 0.999)
+        )
+        
+        # Learning rate scheduler with warmup
+        self.scheduler = self._create_scheduler()
+        
+        # Early stopping
+        self.patience = cfg.patience
+        self.best_val_loss = float('inf')
+        self.epochs_no_improve = 0
+        self.early_stop = False
+        
+        # Gradient clipping
+        self.clip_value = cfg.grad_clip
+        
+        # Metrics tracking
+        self.train_metrics = {
+            'loss': [], 'accuracy': [], 'precision': [], 'recall': [], 'f1': []
         }
-    }
-
-
-def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train LightGBM model with progress bar and class balancing"""
-    import lightgbm as lgb
-    from tqdm import tqdm
-    from collections import Counter
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Training LightGBM for {symbol}")
-
-    # Ensure output directory exists
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Calculate class weights for imbalanced data
-    class_counts = Counter(y_train)
-    total_samples = len(y_train)
-    num_classes = len(class_counts)
-
-    # Compute sample weights (inverse frequency weighting)
-    class_weights = {
-        cls: total_samples / (num_classes * count)
-        for cls, count in class_counts.items()
-    }
-    sample_weights = np.array([class_weights[y] for y in y_train])
-
-    logger.info(f"Class distribution: {dict(class_counts)}")
-    logger.info(f"Class weights: {class_weights}")
-
-    # Create dataset with sample weights
-    train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weights)
-    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        self.val_metrics = {
+            'loss': [], 'accuracy': [], 'precision': [], 'recall': [], 'f1': []
+        }
+        
+        # Initialize wandb if enabled
+        if cfg.use_wandb:
+            wandb.init(project="TradeFast-Mamba", config=vars(cfg))
     
-    # Get model parameters
-    params = cfg["models"]["lightgbm"].copy()
-    params.update({
-        "objective": "multiclass",
-        "num_class": len(np.unique(y_train)),
-        "verbosity": -1,
-        "metric": "multi_logloss"
-    })
-    
-    # Training with progress bar
-    callbacks = [
-        lgb.early_stopping(stopping_rounds=50),
-    ]
-    
-    # Custom progress callback
-    class ProgressCallback:
-        def __init__(self, total_iterations):
-            self.pbar = tqdm(total=total_iterations, desc=f"{symbol} - LightGBM",
-                           unit="iter", ncols=120)
-            self.best_score = float('inf')
-
-        def __call__(self, env):
-            current_iter = env.iteration + 1  # iteration is 0-indexed
-            eval_result = env.evaluation_result_list
-
-            train_loss = None
-            val_loss = None
-
-            if eval_result:
-                # LightGBM returns tuples of (dataset_name, metric_name, value, is_higher_better)
-                for item in eval_result:
-                    if len(item) >= 3:
-                        dataset_name, metric_name, value = item[0], item[1], item[2]
-                        if dataset_name == 'train':
-                            train_loss = value
-                        elif dataset_name == 'valid':
-                            val_loss = value
-
-            if val_loss is not None and val_loss < self.best_score:
-                self.best_score = val_loss
-
-            # Update progress bar with metrics
-            self.pbar.n = current_iter
-            self.pbar.set_postfix(
-                train=f'{train_loss:.4f}' if train_loss else '?',
-                val=f'{val_loss:.4f}' if val_loss else '?',
-                best=f'{self.best_score:.4f}' if self.best_score < float('inf') else '?',
-                refresh=False
+    def _create_scheduler(self):
+        """Create learning rate scheduler with warmup"""
+        if self.cfg.scheduler == 'cosine':
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=self.cfg.warmup_epochs,
+                T_mult=2,
+                eta_min=self.cfg.min_lr
             )
-            self.pbar.refresh()
-
-        def close(self):
-            self.pbar.close()
-    
-    # Train model
-    total_iterations = params.get("n_estimators", 500)
-    progress_callback = ProgressCallback(total_iterations)
-    
-    bst = lgb.train(
-        params,
-        train_data,
-        valid_sets=[train_data, val_data],
-        valid_names=['train', 'valid'],
-        num_boost_round=total_iterations,
-        callbacks=callbacks + [progress_callback]
-    )
-    
-    progress_callback.close()
-    
-    # Save model
-    model_path = output_path / "lightgbm.joblib"
-    import joblib
-    joblib.dump(bst, model_path)
-    logger.info(f"LightGBM model saved to {model_path}")
-    
-    # Print final stats
-    y_pred = bst.predict(X_val)
-    y_pred_class = np.argmax(y_pred, axis=1)
-    accuracy = np.mean(y_pred_class == y_val)
-
-    logger.info(f"LightGBM final validation accuracy: {accuracy:.4f}")
-
-    # Print confusion matrix and per-class metrics
-    metrics = print_classification_metrics(y_val, y_pred_class, "LightGBM", symbol)
-
-    # Save metrics to JSON
-    import json
-    metrics_path = output_path / "lightgbm_metrics.json"
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-    return bst
-
-
-def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train XGBoost model with progress bar and class balancing"""
-    import xgboost as xgb
-    from tqdm import tqdm
-    from collections import Counter
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Training XGBoost for {symbol}")
-
-    # Ensure output directory exists
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Calculate class weights for imbalanced data
-    class_counts = Counter(y_train)
-    total_samples = len(y_train)
-    num_classes = len(class_counts)
-
-    # Compute sample weights (inverse frequency weighting)
-    class_weights = {
-        cls: total_samples / (num_classes * count)
-        for cls, count in class_counts.items()
-    }
-    sample_weights = np.array([class_weights[y] for y in y_train])
-
-    logger.info(f"Class distribution: {dict(class_counts)}")
-    logger.info(f"Class weights: {class_weights}")
-
-    # Create dataset with sample weights
-    dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weights)
-    dval = xgb.DMatrix(X_val, label=y_val)
-    
-    # Get model parameters
-    params = cfg["models"]["xgboost"].copy()
-    params.update({
-        "objective": "multi:softprob",
-        "num_class": len(np.unique(y_train)),
-        "eval_metric": "mlogloss",
-        "verbosity": 0
-    })
-    
-    # Training with progress bar
-    watchlist = [(dtrain, 'train'), (dval, 'eval')]
-    num_rounds = params.get("n_estimators", 500)
-    
-    # Custom callback for progress bar
-    class XGBProgressCallback(xgb.callback.TrainingCallback):
-        def __init__(self, symbol):
-            self.symbol = symbol
-            self.pbar = None
-            self.best_score = float('inf')
-            self.history = {'train': [], 'eval': []}
-
-        def after_iteration(self, model, epoch, evals_log):
-            if self.pbar is None:
-                self.pbar = tqdm(total=num_rounds, desc=f"{self.symbol} - XGBoost",
-                               unit="iter", ncols=120)
-
-            # Get latest metrics
-            train_loss = evals_log['train']['mlogloss'][-1] if 'train' in evals_log else None
-            eval_loss = evals_log['eval']['mlogloss'][-1] if 'eval' in evals_log else None
-
-            if eval_loss is not None and eval_loss < self.best_score:
-                self.best_score = eval_loss
-
-            # Update progress bar
-            self.pbar.n = epoch + 1
-            self.pbar.set_postfix(
-                train=f'{train_loss:.4f}' if train_loss else '?',
-                val=f'{eval_loss:.4f}' if eval_loss else '?',
-                best=f'{self.best_score:.4f}' if self.best_score < float('inf') else '?',
-                refresh=False
+        elif self.cfg.scheduler == 'plateau':
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=0.5,
+                patience=5,
+                min_lr=self.cfg.min_lr
             )
-            self.pbar.refresh()
-
-            # Store history
-            if train_loss:
-                self.history['train'].append(train_loss)
-            if eval_loss:
-                self.history['eval'].append(eval_loss)
-
+        else:
+            # Linear warmup then cosine decay
+            def lr_lambda(epoch):
+                if epoch < self.cfg.warmup_epochs:
+                    return float(epoch) / float(max(1, self.cfg.warmup_epochs))
+                else:
+                    progress = float(epoch - self.cfg.warmup_epochs) / float(max(1, self.cfg.total_epochs - self.cfg.warmup_epochs))
+                    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            
+            scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        
+        return scheduler
+    
+    def train_epoch(self, train_loader):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        all_preds = []
+        all_targets = []
+        
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(self.device), target.to(self.device)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            logits, confidence = self.model(data)
+            
+            # Calculate losses
+            cls_loss = self.classification_loss(logits, target)
+            
+            # Confidence loss based on accuracy
+            with torch.no_grad():
+                preds = torch.argmax(logits, dim=1)
+                correct = (preds == target).float()
+            
+            conf_loss = self.confidence_loss(confidence.squeeze(), correct)
+            
+            # Combined loss
+            loss = cls_loss + 0.1 * conf_loss
+            
+            # Backward pass with gradient clipping
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_value)
+            
+            self.optimizer.step()
+            
+            # Accumulate metrics
+            total_loss += loss.item()
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
+            
+            # Log progress
+            if batch_idx % 100 == 0:
+                print(f'  Batch {batch_idx}/{len(train_loader)}: Loss={loss.item():.4f}')
+        
+        # Calculate epoch metrics
+        avg_loss = total_loss / len(train_loader)
+        accuracy = accuracy_score(all_targets, all_preds)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, average='weighted', zero_division=0
+        )
+        
+        return avg_loss, accuracy, precision, recall, f1
+    
+    def validate(self, val_loader):
+        """Validate model"""
+        self.model.eval()
+        total_loss = 0
+        all_preds = []
+        all_targets = []
+        all_confidences = []
+        
+        with torch.no_grad():
+            for data, target in val_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # Forward pass
+                logits, confidence = self.model(data)
+                
+                # Calculate loss
+                loss = self.classification_loss(logits, target)
+                total_loss += loss.item()
+                
+                # Get predictions
+                preds = torch.argmax(logits, dim=1)
+                
+                # Accumulate
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
+                all_confidences.extend(confidence.squeeze().cpu().numpy())
+        
+        # Calculate metrics
+        avg_loss = total_loss / len(val_loader)
+        accuracy = accuracy_score(all_targets, all_preds)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, average='weighted', zero_division=0
+        )
+        
+        # Calculate confusion matrix
+        cm = confusion_matrix(all_targets, all_preds)
+        
+        # Calculate balanced accuracy
+        if cm.shape[0] == 2:  # Binary classification
+            tn, fp, fn, tp = cm.ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            balanced_acc = (sensitivity + specificity) / 2
+        else:
+            balanced_acc = accuracy
+        
+        return {
+            'loss': avg_loss,
+            'accuracy': accuracy,
+            'balanced_accuracy': balanced_acc,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'confusion_matrix': cm,
+            'confidence_mean': np.mean(all_confidences),
+            'confidence_std': np.std(all_confidences)
+        }
+    
+    def early_stopping_check(self, val_loss):
+        """Check for early stopping"""
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.epochs_no_improve = 0
+            # Save best model
+            torch.save({
+                'epoch': self.current_epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'val_loss': val_loss,
+            }, f'best_model_{self.cfg.symbol}.pth')
             return False  # Continue training
-
-        def after_training(self, model):
-            if self.pbar:
-                self.pbar.close()
-            return model
+        else:
+            self.epochs_no_improve += 1
+            if self.epochs_no_improve >= self.patience:
+                print(f'Early stopping triggered after {self.current_epoch} epochs')
+                self.early_stop = True
+            return self.early_stop
     
-    # Train model
-    progress_callback = XGBProgressCallback(symbol)
+    def train(self, train_loader, val_loader, num_epochs):
+        """Main training loop"""
+        print(f'Starting training for {num_epochs} epochs')
+        
+        for epoch in range(num_epochs):
+            self.current_epoch = epoch
+            
+            # Train
+            train_loss, train_acc, train_prec, train_rec, train_f1 = self.train_epoch(train_loader)
+            
+            # Validate
+            val_results = self.validate(val_loader)
+            
+            # Update learning rate
+            if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                self.scheduler.step(val_results['loss'])
+            else:
+                self.scheduler.step()
+            
+            # Log metrics
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
+            print(f'\nEpoch {epoch + 1}/{num_epochs}:')
+            print(f'  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.2%}, F1: {train_f1:.4f}')
+            print(f'  Val   - Loss: {val_results["loss"]:.4f}, Acc: {val_results["accuracy"]:.2%}, '
+                  f'Bal Acc: {val_results["balanced_accuracy"]:.2%}, F1: {val_results["f1"]:.4f}')
+            print(f'  LR: {current_lr:.2e}, Confidence: {val_results["confidence_mean"]:.3f} ± {val_results["confidence_std"]:.3f}')
+            
+            # Wandb logging
+            if self.cfg.use_wandb:
+                wandb.log({
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'train_accuracy': train_acc,
+                    'train_f1': train_f1,
+                    'val_loss': val_results['loss'],
+                    'val_accuracy': val_results['accuracy'],
+                    'val_balanced_accuracy': val_results['balanced_accuracy'],
+                    'val_f1': val_results['f1'],
+                    'learning_rate': current_lr,
+                    'confidence_mean': val_results['confidence_mean'],
+                    'confidence_std': val_results['confidence_std']
+                })
+            
+            # Early stopping check
+            if self.early_stopping_check(val_results['loss']):
+                break
+        
+        print(f'\nTraining completed. Best validation loss: {self.best_val_loss:.4f}')
+        return self.model
 
-    # Use callbacks for early stopping and suppress default logging
-    bst = xgb.train(
-        params,
-        dtrain,
-        num_boost_round=num_rounds,
-        evals=watchlist,
-        callbacks=[
-            progress_callback,
-            xgb.callback.EarlyStopping(rounds=50, save_best=True),
-        ],
-        verbose_eval=False  # Suppress default logging
+def create_data_loaders(X_train, y_train, X_val, y_val, batch_size=32, shuffle=True):
+    """Create enhanced data loaders with proper batching"""
+    # Convert to tensors
+    train_dataset = TensorDataset(
+        torch.FloatTensor(X_train),
+        torch.LongTensor(y_train)
     )
     
-    # Save model
-    model_path = output_path / "xgboost.joblib"
-    import joblib
-    joblib.dump(bst, model_path)
-    logger.info(f"XGBoost model saved to {model_path}")
+    val_dataset = TensorDataset(
+        torch.FloatTensor(X_val),
+        torch.LongTensor(y_val)
+    )
     
-    # Print final stats
-    y_pred = bst.predict(dval)
-    y_pred_class = np.argmax(y_pred, axis=1)
-    accuracy = np.mean(y_pred_class == y_val)
+    # Create loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True  # Drop last incomplete batch
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size * 2,  # Larger batch for validation
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader
 
-    logger.info(f"XGBoost final validation accuracy: {accuracy:.4f}")
-
-    # Print confusion matrix and per-class metrics
-    metrics = print_classification_metrics(y_val, y_pred_class, "XGBoost", symbol)
-
-    # Save metrics to JSON
-    import json
-    metrics_path = output_path / "xgboost_metrics.json"
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-    return bst
-
+def analyze_class_balance(y_train, y_val):
+    """Analyze and report class balance"""
+    train_counts = np.bincount(y_train)
+    val_counts = np.bincount(y_val)
+    
+    print("\nClass Distribution Analysis:")
+    print(f"Train set: {dict(enumerate(train_counts))}")
+    print(f"Validation set: {dict(enumerate(val_counts))}")
+    
+    # Calculate class weights for imbalance
+    class_weights = len(y_train) / (len(np.unique(y_train)) * train_counts)
+    class_weights = class_weights / class_weights.sum() * len(class_weights)
+    
+    print(f"Class weights for loss: {class_weights}")
+    
+    return class_weights.tolist()
 
 def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train Mamba model with advanced techniques for world-class performance"""
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    import numpy as np
-    import logging
-    from torch.utils.data import DataLoader, Dataset
-    from tqdm import tqdm
-    import time
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Training Mamba for {symbol} with advanced techniques")
-
-    # ==================== ADVANCED LOSS FUNCTIONS ====================
-
-    class FocalLoss(nn.Module):
-        """
-        Focal Loss - focuses on hard-to-classify examples.
-        Reduces loss for well-classified examples, focusing training on hard negatives.
-        Paper: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
-        """
-        def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.1):
-            super().__init__()
-            self.alpha = alpha  # class weights
-            self.gamma = gamma  # focusing parameter (higher = more focus on hard examples)
-            self.reduction = reduction
-            self.label_smoothing = label_smoothing
-
-        def forward(self, inputs, targets):
-            # Apply label smoothing
-            num_classes = inputs.size(-1)
-            if self.label_smoothing > 0:
-                with torch.no_grad():
-                    smooth_targets = torch.zeros_like(inputs)
-                    smooth_targets.fill_(self.label_smoothing / (num_classes - 1))
-                    smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
-
-            # Compute softmax probabilities
-            p = F.softmax(inputs, dim=-1)
-            ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-
-            # Get probability of true class
-            p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
-
-            # Focal weight: (1 - p_t)^gamma
-            focal_weight = (1 - p_t) ** self.gamma
-
-            # Apply focal weight
-            loss = focal_weight * ce_loss
-
-            if self.reduction == 'mean':
-                return loss.mean()
-            elif self.reduction == 'sum':
-                return loss.sum()
-            return loss
-
-    def mixup_data(x, y, alpha=0.4):
-        """
-        Mixup augmentation - creates virtual training examples.
-        Paper: "mixup: Beyond Empirical Risk Minimization" (Zhang et al., 2017)
-        """
-        if alpha > 0:
-            lam = np.random.beta(alpha, alpha)
-        else:
-            lam = 1
-
-        batch_size = x.size(0)
-        index = torch.randperm(batch_size).to(x.device)
-
-        mixed_x = lam * x + (1 - lam) * x[index, :]
-        y_a, y_b = y, y[index]
-        return mixed_x, y_a, y_b, lam
-
-    def mixup_criterion(criterion, pred, y_a, y_b, lam):
-        """Loss function for mixup training"""
-        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+    """Enhanced training function for Mamba model"""
     
-    # Ensure output directory exists
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Convert to float32 and handle NaN/Inf
-    X_train = X_train.astype(np.float32)
-    X_val = X_val.astype(np.float32)
-
-    # Replace NaN and Inf with 0
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Standardize features (critical for neural networks!)
+    print(f"\n{'='*60}")
+    print(f"Training Mamba model for {symbol}")
+    print(f"{'='*60}")
+    
+    # Analyze data
+    cfg.class_weights = analyze_class_balance(y_train, y_val)
+    
+    # Check data dimensions
+    print(f"\nData dimensions:")
+    print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
+    print(f"  X_val: {X_val.shape}, y_val: {y_val.shape}")
+    
+    # Check for NaN values
+    if np.isnan(X_train).any() or np.isnan(X_val).any():
+        print("Warning: NaN values detected in data!")
+        X_train = np.nan_to_num(X_train)
+        X_val = np.nan_to_num(X_val)
+    
+    # Normalize data
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_val = scaler.transform(X_val)
-
-    # Clip extreme values after standardization
-    X_train = np.clip(X_train, -10, 10)
-    X_val = np.clip(X_val, -10, 10)
-
-    logger.info(f"Data stats after preprocessing - Train: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
-    logger.info(f"Data stats after preprocessing - Val: mean={X_val.mean():.4f}, std={X_val.std():.4f}")
-    
-    # Define Dataset class
-    class SequenceDataset(Dataset):
-        def __init__(self, X, y, seq_len):
-            self.X = X
-            self.y = y
-            self.seq_len = seq_len
-            
-        def __len__(self):
-            return len(self.X) - self.seq_len
-        
-        def __getitem__(self, idx):
-            return (
-                torch.FloatTensor(self.X[idx:idx+self.seq_len]),
-                torch.LongTensor([self.y[idx+self.seq_len]])
-            )
-    
-    # Get sequence length from config
-    seq_len = cfg["models"]["mamba"].get("seq_length", 128)
-    
-    # Create datasets
-    train_dataset = SequenceDataset(X_train, y_train, seq_len)
-    val_dataset = SequenceDataset(X_val, y_val, seq_len)
+    X_train = scaler.fit_transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
+    X_val = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
     
     # Create data loaders
-    batch_size = cfg["models"]["mamba"]["batch_size"]
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=min(4, cfg["hardware"]["cpu"]["num_workers"]),
-        pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
+    train_loader, val_loader = create_data_loaders(
+        X_train, y_train, X_val, y_val,
+        batch_size=cfg.batch_size
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=min(2, cfg["hardware"]["cpu"]["num_workers"]),
-        pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
-    )
-    
-    # Import Mamba model - use the REAL MambaTrader, not the placeholder
-    try:
-        from src.models.architectures.mamba_model import MambaTrader
-        logger.info("Using real MambaTrader with MambaBlock layers")
-        use_real_mamba = True
-    except ImportError as e:
-        logger.warning(f"MambaTrader import failed: {e}, using fallback CNN")
-        use_real_mamba = False
-
     # Initialize model
-    input_dim = X_train.shape[1]
-    num_classes = len(np.unique(y_train))
-
-    model_config = cfg["models"]["mamba"]
-
-    if use_real_mamba:
-        # Real Mamba model with state space layers
-        model = MambaTrader(
-            input_dim=input_dim,
-            d_model=model_config["d_model"],
-            d_state=model_config["d_state"],
-            d_conv=model_config["d_conv"],
-            expand=model_config["expand"],
-            n_layers=model_config["n_layers"],
-            dropout=model_config["dropout"],
-            n_classes=num_classes,
-            use_checkpointing=True
-        )
+    from src.models.architectures.mamba_model import EnhancedMambaTradingModel
+    model = EnhancedMambaTradingModel(cfg)
+    
+    print(f"\nModel architecture:")
+    print(model)
+    print(f"\nTotal parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\nUsing device: {device}")
+    
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+        print(f"Memory cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+    
+    # Initialize trainer
+    trainer = ImprovedTrainer(model, cfg, device)
+    
+    # Train model
+    model = trainer.train(train_loader, val_loader, cfg.num_epochs)
+    
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'scaler_state': scaler,
+        'cfg': cfg,
+        'val_metrics': trainer.val_metrics,
+    }, output_path)
+    
+    print(f"\nModel saved to: {output_path}")
+    
+    # Final evaluation
+    final_results = trainer.validate(val_loader)
+    
+    print(f"\n{'='*60}")
+    print("FINAL EVALUATION")
+    print(f"{'='*60}")
+    print(f"Validation Loss: {final_results['loss']:.4f}")
+    print(f"Validation Accuracy: {final_results['accuracy']:.2%}")
+    print(f"Balanced Accuracy: {final_results['balanced_accuracy']:.2%}")
+    print(f"F1 Score: {final_results['f1']:.4f}")
+    print(f"Precision: {final_results['precision']:.4f}")
+    print(f"Recall: {final_results['recall']:.4f}")
+    print(f"Confidence: {final_results['confidence_mean']:.3f} ± {final_results['confidence_std']:.3f}")
+    
+    if 'confusion_matrix' in final_results:
+        print(f"\nConfusion Matrix:")
+        print(final_results['confusion_matrix'])
+    
+    # Check if model is usable for trading
+    if final_results['balanced_accuracy'] > 0.52 and final_results['f1'] > 0.5:
+        print("\n✅ Model shows potential for trading (balanced accuracy > 52%)")
     else:
-        # Fallback simple CNN (not recommended)
-        class FallbackCNN(nn.Module):
-            def __init__(self, input_dim, num_classes, d_model=64, dropout=0.1):
-                super().__init__()
-                self.conv1 = nn.Conv1d(input_dim, d_model, kernel_size=3, padding=1)
-                self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
-                self.pool = nn.AdaptiveAvgPool1d(1)
-                self.dropout = nn.Dropout(dropout)
-                self.classifier = nn.Sequential(
-                    nn.Linear(d_model, d_model // 2),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(d_model // 2, num_classes)
-                )
-
-            def forward(self, x):
-                x = x.transpose(1, 2)
-                x = torch.relu(self.conv1(x))
-                x = torch.relu(self.conv2(x))
-                x = self.pool(x).squeeze(-1)
-                x = self.dropout(x)
-                return self.classifier(x)
-
-        model = FallbackCNN(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            d_model=model_config["d_model"],
-            dropout=model_config["dropout"]
-        )
+        print("\n⚠️  Model performance is below trading thresholds")
+        print("   Consider: More data, Feature engineering, Model simplification")
     
-    # Move to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    logger.info(f"Using device: {device}")
-
-    # Log model size
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    model_size_mb = total_params * 4 / (1024 * 1024)  # float32 = 4 bytes
-    logger.info(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
-    logger.info(f"Estimated model size: {model_size_mb:.2f} MB")
-
-    # Calculate class weights for imbalanced data
-    from collections import Counter
-    class_counts = Counter(y_train)
-    total_samples = len(y_train)
-    num_classes = len(class_counts)
-    class_weights = torch.FloatTensor([
-        total_samples / (num_classes * class_counts.get(i, 1))
-        for i in range(num_classes)
-    ]).to(device)
-
-    logger.info(f"Class distribution: {dict(class_counts)}")
-    logger.info(f"Class weights: {class_weights.tolist()}")
-
-    # ==================== ADVANCED TRAINING SETUP ====================
-
-    # Training hyperparameters - CONSERVATIVE LR for stability
-    base_lr = model_config["learning_rate"]  # 0.001 from config
-    max_lr = base_lr * 3  # Peak at 0.003 (conservative)
-    gradient_accumulation_steps = 4  # Effective batch size = batch_size * 4
-    use_mixup = True
-    mixup_alpha = 0.4
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=base_lr,
-        weight_decay=cfg["training"]["optimizer"]["weight_decay"],
-        betas=(0.9, 0.999),
-        eps=1e-8
-    )
-
-    # OneCycleLR with conservative learning rates
-    total_steps = len(train_loader) * cfg["training"]["epochs"] // gradient_accumulation_steps
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=max_lr,
-        total_steps=total_steps,
-        pct_start=0.1,  # 10% warmup
-        anneal_strategy='cos',
-        div_factor=10,  # initial_lr = max_lr / 10 = 0.0003
-        final_div_factor=100  # final_lr = initial_lr / 100
-    )
-
-    # Focal Loss with label smoothing - much better for imbalanced data
-    criterion = FocalLoss(
-        alpha=class_weights,
-        gamma=2.0,  # Focus on hard examples
-        label_smoothing=0.1  # Prevent overconfidence
-    )
-
-    logger.info(f"Using Focal Loss with gamma=2.0, label_smoothing=0.1")
-    logger.info(f"Using OneCycleLR: base_lr={base_lr:.6f}, max_lr={max_lr:.6f}")
-    logger.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
-    logger.info(f"Mixup augmentation: {use_mixup} (alpha={mixup_alpha})")
-    
-    # Training loop with progress bar
-    epochs = cfg["training"]["epochs"]
-    best_val_loss = float('inf')
-    best_val_acc = 0.0
-    patience_counter = 0
-    early_stopping_patience = cfg["training"]["early_stopping_patience"]
-    checkpoint_every = 5  # Save checkpoint every N epochs
-    start_epoch = 0
-
-    # Create checkpoint directory
-    checkpoint_dir = output_path / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Check for existing checkpoint to resume from
-    resume_checkpoint = checkpoint_dir / "latest_checkpoint.pt"
-    if resume_checkpoint.exists():
-        logger.info(f"Found checkpoint, resuming training...")
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        best_val_acc = checkpoint.get('best_val_acc', 0.0)
-        logger.info(f"Resumed from epoch {start_epoch}, best_val_loss: {best_val_loss:.4f}")
-
-    # Training statistics
-    train_history = []
-    val_history = []
-
-    # Create main progress bar for epochs - use ncols to show stats properly
-    epoch_pbar = tqdm(range(start_epoch, epochs), desc=f"{symbol} - Mamba",
-                     unit="epoch", ncols=140, initial=start_epoch, total=epochs)
-    
-    for epoch in epoch_pbar:
-        # Training with mixup and gradient accumulation
-        model.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-        accumulated_loss = 0
-        optimizer.zero_grad()
-
-        # Batch progress bar
-        batch_pbar = tqdm(train_loader, desc=f"  Train",
-                         leave=False, unit="batch", ncols=100)
-
-        for batch_idx, (batch_X, batch_y) in enumerate(batch_pbar):
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
-
-            # Apply mixup augmentation
-            if use_mixup and np.random.random() > 0.5:  # 50% chance of mixup
-                batch_X, y_a, y_b, lam = mixup_data(batch_X, batch_y, mixup_alpha)
-                outputs = model(batch_X)
-                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
-            else:
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
-
-            # Scale loss for gradient accumulation
-            loss = loss / gradient_accumulation_steps
-            loss.backward()
-            accumulated_loss += loss.item()
-
-            # Gradient accumulation step
-            if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    cfg["training"]["gradient_clip"]
-                )
-
-                optimizer.step()
-                scheduler.step()  # OneCycleLR steps per batch
-                optimizer.zero_grad()
-
-                train_loss += accumulated_loss * gradient_accumulation_steps
-                accumulated_loss = 0
-
-            # Calculate accuracy (for non-mixup batches only for clean metric)
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += batch_y.size(0)
-            train_correct += (predicted == batch_y).sum().item()
-
-            # Update batch progress
-            current_lr = scheduler.get_last_lr()[0]
-            batch_pbar.set_postfix({
-                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                'acc': f'{train_correct/train_total:.4f}' if train_total > 0 else '0.0000',
-                'lr': f'{current_lr:.2e}'
-            })
-
-        batch_pbar.close()
-        avg_train_loss = train_loss / len(train_loader)
-        train_accuracy = train_correct / train_total if train_total > 0 else 0
-        
-        # Validation (use standard CE loss for cleaner metrics)
-        model.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
-        val_criterion = nn.CrossEntropyLoss(weight=class_weights)  # Standard loss for validation
-
-        # Per-class tracking for monitoring
-        class_correct = {i: 0 for i in range(num_classes)}
-        class_total = {i: 0 for i in range(num_classes)}
-
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"  Valid",
-                           leave=False, unit="batch", ncols=100)
-
-            for batch_X, batch_y in val_pbar:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
-                outputs = model(batch_X)
-                loss = val_criterion(outputs, batch_y)
-                val_loss += loss.item()
-
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += batch_y.size(0)
-                val_correct += (predicted == batch_y).sum().item()
-
-                # Track per-class accuracy
-                for i in range(num_classes):
-                    mask = batch_y == i
-                    class_total[i] += mask.sum().item()
-                    class_correct[i] += ((predicted == batch_y) & mask).sum().item()
-
-                # Update validation progress
-                val_pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'acc': f'{val_correct/val_total:.4f}' if val_total > 0 else '0.0000'
-                })
-
-            val_pbar.close()
-
-        avg_val_loss = val_loss / len(val_loader)
-        val_accuracy = val_correct / val_total if val_total > 0 else 0
-
-        # Calculate per-class accuracy
-        per_class_acc = {i: class_correct[i] / max(class_total[i], 1) for i in range(num_classes)}
-        balanced_acc = np.mean(list(per_class_acc.values()))
-
-        # Get current LR (OneCycleLR steps per batch, so just get current value)
-        current_lr = scheduler.get_last_lr()[0]
-
-        # Store history with balanced accuracy
-        train_history.append({
-            'epoch': epoch,
-            'train_loss': avg_train_loss,
-            'train_acc': train_accuracy,
-            'val_loss': avg_val_loss,
-            'val_acc': val_accuracy,
-            'balanced_acc': balanced_acc,
-            'per_class_acc': per_class_acc,
-            'lr': current_lr
-        })
-
-        # Update epoch progress bar with balanced accuracy
-        epoch_pbar.set_postfix({
-            'loss': f'{avg_train_loss:.4f}',
-            'acc': f'{train_accuracy:.2%}',
-            'v_loss': f'{avg_val_loss:.4f}',
-            'v_acc': f'{val_accuracy:.2%}',
-            'bal': f'{balanced_acc:.2%}',  # Balanced accuracy is key metric
-            'lr': f'{current_lr:.2e}'
-        })
-
-        # Log per-class accuracy periodically
-        if (epoch + 1) % 5 == 0:
-            class_names = ['Buy', 'Hold', 'Sell']
-            logger.info(f"Epoch {epoch+1} per-class acc: " +
-                       ", ".join([f"{class_names[i]}={per_class_acc[i]:.2%}" for i in range(min(num_classes, 3))]))
-
-        # Early stopping check
-        is_best = avg_val_loss < best_val_loss
-        if is_best:
-            best_val_loss = avg_val_loss
-            best_val_acc = val_accuracy
-            patience_counter = 0
-            # Save best model
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'val_accuracy': val_accuracy,
-                'best_val_loss': best_val_loss,
-                'best_val_acc': best_val_acc,
-                'history': train_history,
-                'config': model_config
-            }, output_path / "mamba_best.pt")
-            epoch_pbar.set_description(f"{symbol} - Mamba ★")
-        else:
-            patience_counter += 1
-
-        # Save periodic checkpoint every N epochs
-        if (epoch + 1) % checkpoint_every == 0 or epoch == start_epoch:
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'val_accuracy': val_accuracy,
-                'best_val_loss': best_val_loss,
-                'best_val_acc': best_val_acc,
-                'train_loss': avg_train_loss,
-                'train_accuracy': train_accuracy,
-                'history': train_history,
-                'config': model_config,
-                'patience_counter': patience_counter
-            }, checkpoint_path)
-            # Also save as latest for resume
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'val_accuracy': val_accuracy,
-                'best_val_loss': best_val_loss,
-                'best_val_acc': best_val_acc,
-                'train_loss': avg_train_loss,
-                'train_accuracy': train_accuracy,
-                'history': train_history,
-                'config': model_config,
-                'patience_counter': patience_counter
-            }, checkpoint_dir / "latest_checkpoint.pt")
-
-        # Early stopping
-        if patience_counter >= early_stopping_patience:
-            logger.info(f"Early stopping at epoch {epoch+1}")
-            epoch_pbar.set_description(f"{symbol} - Mamba (Early Stop)")
-            break
-    
-    epoch_pbar.close()
-    
-    # Save final model
-    torch.save(model.state_dict(), output_path / "mamba_final.pt")
-
-    # Save scaler for inference
-    import joblib
-    joblib.dump(scaler, output_path / "mamba_scaler.joblib")
-
-    # Save training history
-    history_df = pd.DataFrame(train_history)
-    history_path = output_path / "mamba_history.csv"
-    history_df.to_csv(history_path, index=False)
-
-    logger.info(f"Mamba model saved to {output_path}")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    logger.info(f"Final validation accuracy: {val_accuracy:.4f}")
-
-    # Load best model for final predictions
-    best_model_path = output_path / "mamba_best.pt"
-    if best_model_path.exists():
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info("Loaded best model for final evaluation")
-
-    # Generate predictions for confusion matrix
-    model.eval()
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for batch_X, batch_y in val_loader:
-            batch_X = batch_X.to(device)
-            outputs = model(batch_X)
-            _, predicted = torch.max(outputs.data, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(batch_y.squeeze().numpy())
-
-    # Print confusion matrix and per-class metrics
-    metrics = print_classification_metrics(all_labels, all_preds, "Mamba", symbol)
-
-    # Save metrics to JSON
-    import json
-    metrics_path = output_path / "mamba_metrics.json"
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-
     return model
-
-
-def train_tft(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train Temporal Fusion Transformer with progress bar and checkpointing"""
-    import torch
-    import torch.nn as nn
-    import numpy as np
-    import logging
-    from torch.utils.data import DataLoader, Dataset
-    from tqdm import tqdm
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Training TFT for {symbol}")
-
-    # Ensure output directory exists
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Convert to float32 and handle NaN/Inf
-    X_train = X_train.astype(np.float32)
-    X_val = X_val.astype(np.float32)
-
-    # Replace NaN and Inf with 0
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Standardize features (critical for neural networks!)
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_val = scaler.transform(X_val)
-
-    # Clip extreme values after standardization
-    X_train = np.clip(X_train, -10, 10)
-    X_val = np.clip(X_val, -10, 10)
-
-    logger.info(f"Data stats after preprocessing - Train: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
-    logger.info(f"Data stats after preprocessing - Val: mean={X_val.mean():.4f}, std={X_val.std():.4f}")
-
-    # Define Dataset class for sequences
-    class SequenceDataset(Dataset):
-        def __init__(self, X, y, seq_len):
-            self.X = X
-            self.y = y
-            self.seq_len = seq_len
-
-        def __len__(self):
-            return len(self.X) - self.seq_len
-
-        def __getitem__(self, idx):
-            return (
-                torch.FloatTensor(self.X[idx:idx+self.seq_len]),
-                torch.LongTensor([self.y[idx+self.seq_len]])
-            )
-
-    # Get sequence length from config
-    seq_len = cfg["models"]["tft"].get("encoder_length", 168)
-
-    # Create datasets
-    train_dataset = SequenceDataset(X_train, y_train, seq_len)
-    val_dataset = SequenceDataset(X_val, y_val, seq_len)
-
-    # Create data loaders
-    batch_size = cfg["models"]["tft"]["batch_size"]
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=min(4, cfg["hardware"]["cpu"]["num_workers"]),
-        pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=min(2, cfg["hardware"]["cpu"]["num_workers"]),
-        pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
-    )
-
-    # Simple TFT-style model (transformer-based)
-    class SimpleTFT(nn.Module):
-        def __init__(self, input_dim, num_classes, hidden_size=32, n_heads=4, n_layers=2, dropout=0.2):
-            super().__init__()
-            self.input_proj = nn.Linear(input_dim, hidden_size)
-
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=n_heads,
-                dim_feedforward=hidden_size * 4,
-                dropout=dropout,
-                batch_first=True
-            )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-            self.pool = nn.AdaptiveAvgPool1d(1)
-            self.dropout = nn.Dropout(dropout)
-            self.classifier = nn.Linear(hidden_size, num_classes)
-
-        def forward(self, x):
-            # x: (batch, seq_len, features)
-            x = self.input_proj(x)
-            x = self.transformer(x)
-            # Pool over sequence dimension
-            x = x.transpose(1, 2)  # (batch, hidden, seq)
-            x = self.pool(x).squeeze(-1)
-            x = self.dropout(x)
-            return self.classifier(x)
-
-    # Initialize model
-    input_dim = X_train.shape[1]
-    num_classes = len(np.unique(y_train))
-
-    model_config = cfg["models"]["tft"]
-    model = SimpleTFT(
-        input_dim=input_dim,
-        num_classes=num_classes,
-        hidden_size=model_config.get("hidden_size", 32),
-        n_heads=model_config.get("attention_head_size", 4),
-        n_layers=model_config.get("lstm_layers", 2),
-        dropout=model_config.get("dropout", 0.2)
-    )
-
-    # Move to GPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    logger.info(f"Using device: {device}")
-
-    # Training setup
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=model_config.get("learning_rate", 0.003),
-        weight_decay=cfg["training"]["optimizer"]["weight_decay"]
-    )
-
-    criterion = nn.CrossEntropyLoss()
-
-    # Training parameters
-    epochs = cfg["training"]["epochs"]
-    best_val_loss = float('inf')
-    best_val_acc = 0.0
-    patience_counter = 0
-    early_stopping_patience = cfg["training"]["early_stopping_patience"]
-    checkpoint_every = 5
-    start_epoch = 0
-
-    # Create checkpoint directory
-    checkpoint_dir = output_path / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Check for existing checkpoint to resume from
-    resume_checkpoint = checkpoint_dir / "tft_latest_checkpoint.pt"
-    if resume_checkpoint.exists():
-        logger.info(f"Found checkpoint, resuming training...")
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        best_val_acc = checkpoint.get('best_val_acc', 0.0)
-        logger.info(f"Resumed from epoch {start_epoch}, best_val_loss: {best_val_loss:.4f}")
-
-    # Training history
-    train_history = []
-
-    # Training loop
-    epoch_pbar = tqdm(range(start_epoch, epochs), desc=f"{symbol} - TFT",
-                     unit="epoch", ncols=140, initial=start_epoch, total=epochs)
-
-    for epoch in epoch_pbar:
-        # Training phase
-        model.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-
-        batch_pbar = tqdm(train_loader, desc=f"  Train", leave=False, unit="batch", ncols=100)
-
-        for batch_X, batch_y in batch_pbar:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
-
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["gradient_clip"])
-            optimizer.step()
-
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += batch_y.size(0)
-            train_correct += (predicted == batch_y).sum().item()
-
-            batch_pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{train_correct/train_total:.4f}')
-
-        batch_pbar.close()
-        avg_train_loss = train_loss / len(train_loader)
-        train_accuracy = train_correct / train_total if train_total > 0 else 0
-
-        # Validation phase
-        model.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"  Valid", leave=False, unit="batch", ncols=100)
-
-            for batch_X, batch_y in val_pbar:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
-                val_loss += loss.item()
-
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += batch_y.size(0)
-                val_correct += (predicted == batch_y).sum().item()
-
-                val_pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{val_correct/val_total:.4f}')
-
-            val_pbar.close()
-
-        avg_val_loss = val_loss / len(val_loader)
-        val_accuracy = val_correct / val_total if val_total > 0 else 0
-
-        # Store history
-        train_history.append({
-            'epoch': epoch,
-            'train_loss': avg_train_loss,
-            'train_acc': train_accuracy,
-            'val_loss': avg_val_loss,
-            'val_acc': val_accuracy
-        })
-
-        # Update epoch progress bar
-        epoch_pbar.set_postfix(
-            train_loss=f'{avg_train_loss:.4f}',
-            train_acc=f'{train_accuracy:.4f}',
-            val_loss=f'{avg_val_loss:.4f}',
-            val_acc=f'{val_accuracy:.4f}',
-            best_val=f'{best_val_loss:.4f}'
-        )
-
-        # Early stopping check
-        is_best = avg_val_loss < best_val_loss
-        if is_best:
-            best_val_loss = avg_val_loss
-            best_val_acc = val_accuracy
-            patience_counter = 0
-            # Save best model
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'val_accuracy': val_accuracy,
-                'best_val_loss': best_val_loss,
-                'best_val_acc': best_val_acc,
-                'history': train_history,
-                'config': model_config
-            }, output_path / "tft_best.pt")
-            epoch_pbar.set_description(f"{symbol} - TFT ★")
-        else:
-            patience_counter += 1
-
-        # Save periodic checkpoint
-        if (epoch + 1) % checkpoint_every == 0 or epoch == start_epoch:
-            checkpoint_data = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'val_accuracy': val_accuracy,
-                'best_val_loss': best_val_loss,
-                'best_val_acc': best_val_acc,
-                'train_loss': avg_train_loss,
-                'train_accuracy': train_accuracy,
-                'history': train_history,
-                'config': model_config,
-                'patience_counter': patience_counter
-            }
-            torch.save(checkpoint_data, checkpoint_dir / f"tft_checkpoint_epoch_{epoch+1}.pt")
-            torch.save(checkpoint_data, checkpoint_dir / "tft_latest_checkpoint.pt")
-
-        # Early stopping
-        if patience_counter >= early_stopping_patience:
-            logger.info(f"Early stopping at epoch {epoch+1}")
-            epoch_pbar.set_description(f"{symbol} - TFT (Early Stop)")
-            break
-
-    epoch_pbar.close()
-
-    # Save final model
-    torch.save(model.state_dict(), output_path / "tft_final.pt")
-
-    # Save scaler for inference
-    import joblib
-    joblib.dump(scaler, output_path / "tft_scaler.joblib")
-
-    # Save training history
-    history_df = pd.DataFrame(train_history)
-    history_df.to_csv(output_path / "tft_history.csv", index=False)
-
-    logger.info(f"TFT model saved to {output_path}")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    logger.info(f"Final validation accuracy: {val_accuracy:.4f}")
-
-    # Load best model for final predictions
-    best_model_path = output_path / "tft_best.pt"
-    if best_model_path.exists():
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info("Loaded best model for final evaluation")
-
-    # Generate predictions for confusion matrix
-    model.eval()
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for batch_X, batch_y in val_loader:
-            batch_X = batch_X.to(device)
-            outputs = model(batch_X)
-            _, predicted = torch.max(outputs.data, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(batch_y.squeeze().numpy())
-
-    # Print confusion matrix and per-class metrics
-    metrics = print_classification_metrics(all_labels, all_preds, "TFT", symbol)
-
-    # Save metrics to JSON
-    import json
-    metrics_path = output_path / "tft_metrics.json"
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-    return model
-
-
-def main():
-    """Main training function"""
-    # Helper function for DataFrame checking
-    def is_dataframe_empty(df):
-        """Check if a DataFrame (Pandas or Polars) is empty"""
-        if df is None:
-            return True
-        
-        # Check for Polars DataFrame
-        if hasattr(df, 'is_empty'):
-            return df.is_empty()
-        
-        # Check for Pandas DataFrame
-        if hasattr(df, 'empty'):
-            return df.empty
-        
-        # Check if it's empty by length/shape
-        try:
-            if hasattr(df, 'shape'):
-                return df.shape[0] == 0
-            elif hasattr(df, '__len__'):
-                return len(df) == 0
-        except:
-            pass
-        
-        # If we can't determine, assume it's not empty
-        return False
-    
-    parser = argparse.ArgumentParser(description="Train trading models")
-    parser.add_argument("--config", type=str, default="config/base.yaml",
-                       help="Path to config file")
-    parser.add_argument("--model", type=str, default="all",
-                       choices=["lightgbm", "xgboost", "mamba", "tft", "all"],
-                       help="Model to train")
-    parser.add_argument("--symbols", type=str, nargs="+",
-                       help="Specific symbols to train (default: all in config)")
-    parser.add_argument("--optimize", action="store_true",
-                       help="Perform hyperparameter optimization")
-    
-    args = parser.parse_args()
-    
-    # Load config
-    cfg = load_config(args.config)
-    
-    # Setup logging
-    setup_logging(cfg["system"]["log_level"])
-    logger = logging.getLogger(__name__)
-    
-    # Setup GPU optimizations
-    setup_gpu_optimizations()
-    
-    # Get symbols
-    symbol_list = args.symbols or cfg["data"]["symbols"]
-    
-    # Create output directory
-    output_dir = cfg["training"]["checkpoint_dir"]
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Training models for {len(symbol_list)} symbols: {symbol_list}")
-    
-    # Training statistics
-    overall_start_time = time.time()
-    model_times = {}
-    
-    for symbol in symbol_list:
-        symbol_start_time = time.time()
-        logger.info(f"--- Processing {symbol} ---")
-        
-        # Load data
-        feature_store = ParquetStore(cfg["data"]["storage"]["features_path"])
-        
-        try:
-            # The load() method requires category and symbol parameters
-            df = feature_store.load("features", symbol)
-        except Exception as e:
-            logger.error(f"Failed to load data for {symbol}: {e}")
-            
-            # Try alternative: check if the category is different
-            try:
-                # Try "processed" category instead of "features"
-                df = feature_store.load("processed", symbol)
-            except Exception as e2:
-                logger.error(f"Also failed with 'processed' category: {e2}")
-                
-                # Try to list available categories and symbols
-                try:
-                    categories = feature_store.list_categories()
-                    logger.info(f"Available categories: {categories}")
-                    
-                    for cat in categories:
-                        symbols_in_cat = feature_store.list_symbols(cat)
-                        logger.info(f"Symbols in {cat}: {symbols_in_cat}")
-                        
-                        if symbol in symbols_in_cat:
-                            logger.info(f"Found {symbol} in category: {cat}")
-                            df = feature_store.load(cat, symbol)
-                            break
-                except Exception as e3:
-                    logger.error(f"Could not list categories: {e3}")
-                    continue
-        
-         # Add this conversion code here (BEFORE the empty check)
-        # Convert Polars DataFrame to Pandas if needed
-        if hasattr(df, 'to_pandas'):
-            # It's likely a Polars DataFrame
-            logger.info(f"Converting Polars DataFrame to Pandas for {symbol}")
-            df = df.to_pandas()
-        
-        # Now you can use .empty safely
-        if df is None or df.empty:
-            logger.warning(f"No data found for {symbol}, skipping...")
-            continue
-        
-        # Apply triple barrier labeling
-        barrier = TripleBarrier(
-            pt_mult=cfg["strategy"]["triple_barrier"]["pt_mult"],
-            sl_mult=cfg["strategy"]["triple_barrier"]["sl_mult"],
-            max_holding=cfg["strategy"]["triple_barrier"]["max_holding"],
-            vol_span=cfg["strategy"]["triple_barrier"]["vol_span"],
-            min_vol=cfg["strategy"]["triple_barrier"]["min_vol"]
-        )
-        
-        labels = barrier.get_class_labels(df)
-        
-        # Prepare features - exclude non-numeric columns
-        exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'returns', 'timestamp', 'symbol', 'date', 'datetime']
-        feature_cols = [col for col in df.columns if col not in exclude_cols and df[col].dtype in ['float64', 'float32', 'int64', 'int32']]
-        X = df[feature_cols].values.astype(np.float32)
-        y = labels
-        
-        # Split data based on timestamp column
-        val_start = pd.to_datetime(cfg["data"]["validation_period"]["start"])
-        if "timestamp" in df.columns:
-            train_mask = df["timestamp"] < val_start
-            valid_mask = df["timestamp"] >= val_start
-        else:
-            # Fallback to percentage split if no timestamp
-            split_idx = int(len(df) * 0.8)
-            train_mask = np.arange(len(df)) < split_idx
-            valid_mask = np.arange(len(df)) >= split_idx
-        
-        X_train = X[train_mask]
-        y_train = y[train_mask]
-        X_val = X[valid_mask]
-        y_val = y[valid_mask]
-        
-        logger.info(f"Training data: {len(X_train)}, Validation: {len(X_val)}")
-        
-        # Create symbol output directory
-        symbol_output_path = output_path / symbol
-        symbol_output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Rest of your code...
-        
-        # Train models
-        model = args.model.lower()
-        
-        if model in ["lightgbm", "all"]:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Starting LightGBM training for {symbol}")
-            logger.info(f"{'='*60}")
-            lgb_model = train_lightgbm(X_train, y_train, X_val, y_val, cfg, symbol_output_path, symbol)
-        
-        if model in ["xgboost", "all"]:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Starting XGBoost training for {symbol}")
-            logger.info(f"{'='*60}")
-            xgb_model = train_xgboost(X_train, y_train, X_val, y_val, cfg, symbol_output_path, symbol)
-        
-        if model in ["mamba", "all"]:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Starting Mamba training for {symbol}")
-            logger.info(f"{'='*60}")
-            mamba_model = train_mamba(X_train, y_train, X_val, y_val, cfg, symbol_output_path, symbol)
-        
-        if model in ["tft", "all"]:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Starting TFT training for {symbol}")
-            logger.info(f"{'='*60}")
-            tft_model = train_tft(X_train, y_train, X_val, y_val, cfg, symbol_output_path, symbol)
-        
-        symbol_time = time.time() - symbol_start_time
-        model_times[symbol] = symbol_time
-        logger.info(f"Completed {symbol} in {symbol_time:.2f} seconds")
-    
-    # Print summary
-    total_time = time.time() - overall_start_time
-    logger.info(f"\n{'='*80}")
-    logger.info("TRAINING SUMMARY")
-    logger.info(f"{'='*80}")
-    logger.info(f"Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
-    logger.info(f"Models trained: {args.model}")
-    logger.info(f"Symbols processed: {len(symbol_list)}")
-    
-    for symbol, symbol_time in model_times.items():
-        logger.info(f"  {symbol}: {symbol_time:.2f} seconds")
-    
-    logger.info("Training complete!")
-
-
-if __name__ == "__main__":
-    main()
