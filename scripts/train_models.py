@@ -589,23 +589,22 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
 
     # ==================== ADVANCED TRAINING SETUP ====================
 
-    # Training hyperparameters
-    initial_lr = model_config["learning_rate"] * 5  # 5x default LR with OneCycleLR
-    max_lr = initial_lr * 10  # Peak LR for OneCycleLR
+    # Training hyperparameters - CONSERVATIVE LR for stability
+    base_lr = model_config["learning_rate"]  # 0.001 from config
+    max_lr = base_lr * 3  # Peak at 0.003 (conservative)
     gradient_accumulation_steps = 4  # Effective batch size = batch_size * 4
     use_mixup = True
     mixup_alpha = 0.4
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=initial_lr,
+        lr=base_lr,
         weight_decay=cfg["training"]["optimizer"]["weight_decay"],
         betas=(0.9, 0.999),
         eps=1e-8
     )
 
-    # OneCycleLR - superior to cosine annealing for many tasks
-    # Implements the 1cycle policy: warmup -> peak -> annealing
+    # OneCycleLR with conservative learning rates
     total_steps = len(train_loader) * cfg["training"]["epochs"] // gradient_accumulation_steps
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -613,8 +612,8 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         total_steps=total_steps,
         pct_start=0.1,  # 10% warmup
         anneal_strategy='cos',
-        div_factor=25,  # initial_lr = max_lr / 25
-        final_div_factor=1000  # final_lr = initial_lr / 1000
+        div_factor=10,  # initial_lr = max_lr / 10 = 0.0003
+        final_div_factor=100  # final_lr = initial_lr / 100
     )
 
     # Focal Loss with label smoothing - much better for imbalanced data
@@ -625,7 +624,7 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     )
 
     logger.info(f"Using Focal Loss with gamma=2.0, label_smoothing=0.1")
-    logger.info(f"Using OneCycleLR with max_lr={max_lr:.6f}")
+    logger.info(f"Using OneCycleLR: base_lr={base_lr:.6f}, max_lr={max_lr:.6f}")
     logger.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     logger.info(f"Mixup augmentation: {use_mixup} (alpha={mixup_alpha})")
     
