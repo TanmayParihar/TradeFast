@@ -100,15 +100,15 @@ models:
     batch_size: 32
     gradient_checkpointing: true
   mamba:
-    d_model: 64
-    d_state: 64
+    d_model: 128       # Increased from 64 for more capacity
+    d_state: 128       # Increased from 64 for richer state representation
     d_conv: 4
     expand: 2
-    n_layers: 4
-    dropout: 0.1
+    n_layers: 6        # Increased from 4 for deeper model
+    dropout: 0.15      # Slightly increased for regularization
     learning_rate: 0.001
     batch_size: 64
-    seq_length: 64  # 64 bars x 5m = ~5.3 hours of context
+    seq_length: 96     # Increased from 64 for more context (~8 hours at 5m)
   lightgbm:
     n_estimators: 500
     num_leaves: 31

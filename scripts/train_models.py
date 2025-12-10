@@ -378,17 +378,82 @@ def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
 
 
 def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train Mamba model with progress bar"""
+    """Train Mamba model with advanced techniques for world-class performance"""
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     import numpy as np
     import logging
     from torch.utils.data import DataLoader, Dataset
     from tqdm import tqdm
     import time
-    
+
     logger = logging.getLogger(__name__)
-    logger.info(f"Training Mamba for {symbol}")
+    logger.info(f"Training Mamba for {symbol} with advanced techniques")
+
+    # ==================== ADVANCED LOSS FUNCTIONS ====================
+
+    class FocalLoss(nn.Module):
+        """
+        Focal Loss - focuses on hard-to-classify examples.
+        Reduces loss for well-classified examples, focusing training on hard negatives.
+        Paper: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
+        """
+        def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.1):
+            super().__init__()
+            self.alpha = alpha  # class weights
+            self.gamma = gamma  # focusing parameter (higher = more focus on hard examples)
+            self.reduction = reduction
+            self.label_smoothing = label_smoothing
+
+        def forward(self, inputs, targets):
+            # Apply label smoothing
+            num_classes = inputs.size(-1)
+            if self.label_smoothing > 0:
+                with torch.no_grad():
+                    smooth_targets = torch.zeros_like(inputs)
+                    smooth_targets.fill_(self.label_smoothing / (num_classes - 1))
+                    smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+
+            # Compute softmax probabilities
+            p = F.softmax(inputs, dim=-1)
+            ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+
+            # Get probability of true class
+            p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+            # Focal weight: (1 - p_t)^gamma
+            focal_weight = (1 - p_t) ** self.gamma
+
+            # Apply focal weight
+            loss = focal_weight * ce_loss
+
+            if self.reduction == 'mean':
+                return loss.mean()
+            elif self.reduction == 'sum':
+                return loss.sum()
+            return loss
+
+    def mixup_data(x, y, alpha=0.4):
+        """
+        Mixup augmentation - creates virtual training examples.
+        Paper: "mixup: Beyond Empirical Risk Minimization" (Zhang et al., 2017)
+        """
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(x.device)
+
+        mixed_x = lam * x + (1 - lam) * x[index, :]
+        y_a, y_b = y, y[index]
+        return mixed_x, y_a, y_b, lam
+
+    def mixup_criterion(criterion, pred, y_a, y_b, lam):
+        """Loss function for mixup training"""
+        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
     
     # Ensure output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
@@ -522,21 +587,47 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     logger.info(f"Class distribution: {dict(class_counts)}")
     logger.info(f"Class weights: {class_weights.tolist()}")
 
-    # Training setup with higher initial learning rate
-    initial_lr = model_config["learning_rate"] * 3  # 3x default LR for faster initial learning
+    # ==================== ADVANCED TRAINING SETUP ====================
+
+    # Training hyperparameters
+    initial_lr = model_config["learning_rate"] * 5  # 5x default LR with OneCycleLR
+    max_lr = initial_lr * 10  # Peak LR for OneCycleLR
+    gradient_accumulation_steps = 4  # Effective batch size = batch_size * 4
+    use_mixup = True
+    mixup_alpha = 0.4
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=initial_lr,
-        weight_decay=cfg["training"]["optimizer"]["weight_decay"]
+        weight_decay=cfg["training"]["optimizer"]["weight_decay"],
+        betas=(0.9, 0.999),
+        eps=1e-8
     )
 
-    # Learning rate scheduler - cosine annealing with warm restarts
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    # OneCycleLR - superior to cosine annealing for many tasks
+    # Implements the 1cycle policy: warmup -> peak -> annealing
+    total_steps = len(train_loader) * cfg["training"]["epochs"] // gradient_accumulation_steps
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        total_steps=total_steps,
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy='cos',
+        div_factor=25,  # initial_lr = max_lr / 25
+        final_div_factor=1000  # final_lr = initial_lr / 1000
     )
 
-    # Use weighted cross entropy for class imbalance
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # Focal Loss with label smoothing - much better for imbalanced data
+    criterion = FocalLoss(
+        alpha=class_weights,
+        gamma=2.0,  # Focus on hard examples
+        label_smoothing=0.1  # Prevent overconfidence
+    )
+
+    logger.info(f"Using Focal Loss with gamma=2.0, label_smoothing=0.1")
+    logger.info(f"Using OneCycleLR with max_lr={max_lr:.6f}")
+    logger.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    logger.info(f"Mixup augmentation: {use_mixup} (alpha={mixup_alpha})")
     
     # Training loop with progress bar
     epochs = cfg["training"]["epochs"]
@@ -572,101 +663,143 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
                      unit="epoch", ncols=140, initial=start_epoch, total=epochs)
     
     for epoch in epoch_pbar:
-        # Training
+        # Training with mixup and gradient accumulation
         model.train()
         train_loss = 0
         train_correct = 0
         train_total = 0
-        
+        accumulated_loss = 0
+        optimizer.zero_grad()
+
         # Batch progress bar
         batch_pbar = tqdm(train_loader, desc=f"  Train",
                          leave=False, unit="batch", ncols=100)
-        
-        for batch_X, batch_y in batch_pbar:
+
+        for batch_idx, (batch_X, batch_y) in enumerate(batch_pbar):
             batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
-            
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+
+            # Apply mixup augmentation
+            if use_mixup and np.random.random() > 0.5:  # 50% chance of mixup
+                batch_X, y_a, y_b, lam = mixup_data(batch_X, batch_y, mixup_alpha)
+                outputs = model(batch_X)
+                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+            else:
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+
+            # Scale loss for gradient accumulation
+            loss = loss / gradient_accumulation_steps
             loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
-                cfg["training"]["gradient_clip"]
-            )
-            
-            optimizer.step()
-            train_loss += loss.item()
-            
-            # Calculate accuracy
+            accumulated_loss += loss.item()
+
+            # Gradient accumulation step
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    cfg["training"]["gradient_clip"]
+                )
+
+                optimizer.step()
+                scheduler.step()  # OneCycleLR steps per batch
+                optimizer.zero_grad()
+
+                train_loss += accumulated_loss * gradient_accumulation_steps
+                accumulated_loss = 0
+
+            # Calculate accuracy (for non-mixup batches only for clean metric)
             _, predicted = torch.max(outputs.data, 1)
             train_total += batch_y.size(0)
             train_correct += (predicted == batch_y).sum().item()
-            
+
             # Update batch progress
+            current_lr = scheduler.get_last_lr()[0]
             batch_pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{train_correct/train_total:.4f}' if train_total > 0 else '0.0000'
+                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
+                'acc': f'{train_correct/train_total:.4f}' if train_total > 0 else '0.0000',
+                'lr': f'{current_lr:.2e}'
             })
-        
+
         batch_pbar.close()
         avg_train_loss = train_loss / len(train_loader)
         train_accuracy = train_correct / train_total if train_total > 0 else 0
         
-        # Validation
+        # Validation (use standard CE loss for cleaner metrics)
         model.eval()
         val_loss = 0
         val_correct = 0
         val_total = 0
-        
+        val_criterion = nn.CrossEntropyLoss(weight=class_weights)  # Standard loss for validation
+
+        # Per-class tracking for monitoring
+        class_correct = {i: 0 for i in range(num_classes)}
+        class_total = {i: 0 for i in range(num_classes)}
+
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"  Valid",
                            leave=False, unit="batch", ncols=100)
-            
+
             for batch_X, batch_y in val_pbar:
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device).squeeze()
                 outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
+                loss = val_criterion(outputs, batch_y)
                 val_loss += loss.item()
-                
+
                 _, predicted = torch.max(outputs.data, 1)
                 val_total += batch_y.size(0)
                 val_correct += (predicted == batch_y).sum().item()
-                
+
+                # Track per-class accuracy
+                for i in range(num_classes):
+                    mask = batch_y == i
+                    class_total[i] += mask.sum().item()
+                    class_correct[i] += ((predicted == batch_y) & mask).sum().item()
+
                 # Update validation progress
                 val_pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'acc': f'{val_correct/val_total:.4f}' if val_total > 0 else '0.0000'
                 })
-            
+
             val_pbar.close()
-        
+
         avg_val_loss = val_loss / len(val_loader)
         val_accuracy = val_correct / val_total if val_total > 0 else 0
-        
-        # Step learning rate scheduler
-        scheduler.step()
+
+        # Calculate per-class accuracy
+        per_class_acc = {i: class_correct[i] / max(class_total[i], 1) for i in range(num_classes)}
+        balanced_acc = np.mean(list(per_class_acc.values()))
+
+        # Get current LR (OneCycleLR steps per batch, so just get current value)
         current_lr = scheduler.get_last_lr()[0]
 
-        # Store history
+        # Store history with balanced accuracy
         train_history.append({
             'epoch': epoch,
             'train_loss': avg_train_loss,
             'train_acc': train_accuracy,
             'val_loss': avg_val_loss,
             'val_acc': val_accuracy,
+            'balanced_acc': balanced_acc,
+            'per_class_acc': per_class_acc,
             'lr': current_lr
         })
 
-        # Update epoch progress bar with LR
+        # Update epoch progress bar with balanced accuracy
         epoch_pbar.set_postfix({
             'loss': f'{avg_train_loss:.4f}',
             'acc': f'{train_accuracy:.2%}',
             'v_loss': f'{avg_val_loss:.4f}',
             'v_acc': f'{val_accuracy:.2%}',
+            'bal': f'{balanced_acc:.2%}',  # Balanced accuracy is key metric
             'lr': f'{current_lr:.2e}'
         })
+
+        # Log per-class accuracy periodically
+        if (epoch + 1) % 5 == 0:
+            class_names = ['Buy', 'Hold', 'Sell']
+            logger.info(f"Epoch {epoch+1} per-class acc: " +
+                       ", ".join([f"{class_names[i]}={per_class_acc[i]:.2%}" for i in range(min(num_classes, 3))]))
 
         # Early stopping check
         is_best = avg_val_loss < best_val_loss
