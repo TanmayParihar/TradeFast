@@ -520,31 +520,50 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
         pin_memory=cfg["hardware"]["cpu"]["pin_memory"]
     )
     
-    # Import Mamba model
+    # Import Mamba model - use the REAL MambaTrader, not the placeholder
     try:
-        from src.models.architectures.mamba_model import MambaTSClassifier
-    except ImportError:
-        logger.warning("MambaTSClassifier not found, using fallback implementation")
-        
-        # Fallback implementation
-        class MambaTSClassifier(nn.Module):
-            def __init__(self, input_dim, num_classes, d_model=64, d_state=64, 
-                         d_conv=4, expand=2, n_layers=4, dropout=0.1):
+        from src.models.architectures.mamba_model import MambaTrader
+        logger.info("Using real MambaTrader with MambaBlock layers")
+        use_real_mamba = True
+    except ImportError as e:
+        logger.warning(f"MambaTrader import failed: {e}, using fallback CNN")
+        use_real_mamba = False
+
+    # Initialize model
+    input_dim = X_train.shape[1]
+    num_classes = len(np.unique(y_train))
+
+    model_config = cfg["models"]["mamba"]
+
+    if use_real_mamba:
+        # Real Mamba model with state space layers
+        model = MambaTrader(
+            input_dim=input_dim,
+            d_model=model_config["d_model"],
+            d_state=model_config["d_state"],
+            d_conv=model_config["d_conv"],
+            expand=model_config["expand"],
+            n_layers=model_config["n_layers"],
+            dropout=model_config["dropout"],
+            n_classes=num_classes,
+            use_checkpointing=True
+        )
+    else:
+        # Fallback simple CNN (not recommended)
+        class FallbackCNN(nn.Module):
+            def __init__(self, input_dim, num_classes, d_model=64, dropout=0.1):
                 super().__init__()
-                # Simple architecture for testing
                 self.conv1 = nn.Conv1d(input_dim, d_model, kernel_size=3, padding=1)
                 self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
-                
                 self.pool = nn.AdaptiveAvgPool1d(1)
                 self.dropout = nn.Dropout(dropout)
-                
                 self.classifier = nn.Sequential(
                     nn.Linear(d_model, d_model // 2),
                     nn.ReLU(),
                     nn.Dropout(dropout),
                     nn.Linear(d_model // 2, num_classes)
                 )
-            
+
             def forward(self, x):
                 x = x.transpose(1, 2)
                 x = torch.relu(self.conv1(x))
@@ -552,27 +571,25 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
                 x = self.pool(x).squeeze(-1)
                 x = self.dropout(x)
                 return self.classifier(x)
-    
-    # Initialize model
-    input_dim = X_train.shape[1]
-    num_classes = len(np.unique(y_train))
-    
-    model_config = cfg["models"]["mamba"]
-    model = MambaTSClassifier(
-        input_dim=input_dim,
-        num_classes=num_classes,
-        d_model=model_config["d_model"],
-        d_state=model_config["d_state"],
-        d_conv=model_config["d_conv"],
-        expand=model_config["expand"],
-        n_layers=model_config["n_layers"],
-        dropout=model_config["dropout"]
-    )
+
+        model = FallbackCNN(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            d_model=model_config["d_model"],
+            dropout=model_config["dropout"]
+        )
     
     # Move to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     logger.info(f"Using device: {device}")
+
+    # Log model size
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = total_params * 4 / (1024 * 1024)  # float32 = 4 bytes
+    logger.info(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    logger.info(f"Estimated model size: {model_size_mb:.2f} MB")
 
     # Calculate class weights for imbalanced data
     from collections import Counter
