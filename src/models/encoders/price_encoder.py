@@ -1,243 +1,110 @@
-"""
-Price/OHLCV encoder using Mamba or LSTM.
-"""
-
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
 
-
-class MambaBlock(nn.Module):
-    """Simplified Mamba-like block for sequence modeling."""
-
-    def __init__(
-        self,
-        d_model: int,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        dropout: float = 0.1,
-    ):
+class PriceEncoder(nn.Module):
+    """Enhanced price encoder with better initialization and regularization"""
+    
+    def __init__(self, cfg):
         super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_inner = d_model * expand
-
-        # Input projection
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-
-        # Conv layer
-        self.conv = nn.Conv1d(
-            self.d_inner,
-            self.d_inner,
-            kernel_size=d_conv,
-            padding=d_conv - 1,
-            groups=self.d_inner,
+        self.cfg = cfg
+        
+        # Input layer with proper initialization
+        self.input_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        
+        # Temporal encoding
+        self.time_encoding = nn.Parameter(torch.zeros(1, cfg.window_size, cfg.hidden_dim))
+        
+        # Multi-scale convolutional features
+        self.conv_layers = nn.ModuleList([
+            nn.Conv1d(cfg.hidden_dim, cfg.hidden_dim, kernel_size=3, padding=1),
+            nn.Conv1d(cfg.hidden_dim, cfg.hidden_dim, kernel_size=5, padding=2),
+            nn.Conv1d(cfg.hidden_dim, cfg.hidden_dim, kernel_size=7, padding=3),
+        ])
+        
+        # Attention mechanism for feature selection
+        self.attention = nn.MultiheadAttention(
+            cfg.hidden_dim, num_heads=4, batch_first=True, dropout=0.1
         )
-
-        # SSM parameters
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(d_state, self.d_inner, bias=True)
-
-        # Output
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d_model)
-
+        
+        # Layer normalization
+        self.ln1 = nn.LayerNorm(cfg.hidden_dim)
+        self.ln2 = nn.LayerNorm(cfg.hidden_dim)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(0.1)
+        
+        # Output projection
+        self.output_proj = nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim)
+        
+        # Initialize weights properly
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Xavier initialization for better convergence"""
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                if 'conv' in name:
+                    nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+                elif 'attention' in name:
+                    if param.dim() > 1:
+                        nn.init.xavier_uniform_(param)
+                else:
+                    nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0)
+        
+        # Initialize time encoding
+        nn.init.normal_(self.time_encoding, mean=0.0, std=0.02)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, seq_len, d_model)
-
+            x: (batch_size, window_size, input_dim)
         Returns:
-            (batch, seq_len, d_model)
+            encoded: (batch_size, window_size, hidden_dim)
         """
-        residual = x
-        x = self.norm(x)
-
-        # Input projection with gate
-        xz = self.in_proj(x)
-        x, z = xz.chunk(2, dim=-1)
-
-        # Conv
-        x = x.transpose(1, 2)
-        x = self.conv(x)[:, :, :x.size(-1)]
-        x = x.transpose(1, 2)
-
-        # Activation
-        x = x * torch.sigmoid(x)  # SiLU
-
-        # Simplified SSM-like operation
-        x_dbl = self.x_proj(x)
-        dt, B = x_dbl.chunk(2, dim=-1)
-        dt = torch.nn.functional.softplus(self.dt_proj(dt))
-
-        # Simple recurrence approximation
-        x = x * dt
-
-        # Output gate
-        x = x * torch.sigmoid(z)
-        x = self.out_proj(x)
-        x = self.dropout(x)
-
-        return x + residual
-
-
-class PriceEncoder(nn.Module):
-    """
-    Encoder for price/OHLCV time series data.
-
-    Uses a stack of Mamba blocks or LSTM layers for sequence modeling.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        d_model: int = 64,
-        n_layers: int = 4,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        dropout: float = 0.1,
-        use_mamba: bool = True,
-        use_checkpointing: bool = True,
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.d_model = d_model
-        self.use_checkpointing = use_checkpointing
-
-        # Input embedding
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        # Encoder layers
-        if use_mamba:
-            self.layers = nn.ModuleList([
-                MambaBlock(d_model, d_state, d_conv, expand, dropout)
-                for _ in range(n_layers)
-            ])
-        else:
-            # Fallback to LSTM
-            self.layers = nn.ModuleList([
-                nn.LSTM(
-                    d_model,
-                    d_model // 2,
-                    num_layers=1,
-                    batch_first=True,
-                    bidirectional=True,
-                    dropout=dropout if n_layers > 1 else 0,
-                )
-                for _ in range(n_layers)
-            ])
-            self.layer_norms = nn.ModuleList([
-                nn.LayerNorm(d_model) for _ in range(n_layers)
-            ])
-
-        self.use_mamba = use_mamba
-        self.final_norm = nn.LayerNorm(d_model)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_sequence: bool = False,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, input_dim)
-            return_sequence: If True, return full sequence; else return last hidden
-
-        Returns:
-            If return_sequence: (batch, seq_len, d_model)
-            Else: (batch, d_model)
-        """
-        # Input projection
-        x = self.input_proj(x)
-
-        # Encoder layers
-        if self.use_mamba:
-            for layer in self.layers:
-                if self.use_checkpointing and self.training:
-                    x = checkpoint(layer, x, use_reentrant=False)
-                else:
-                    x = layer(x)
-        else:
-            for i, layer in enumerate(self.layers):
-                residual = x
-                x, _ = layer(x)
-                x = self.layer_norms[i](x + residual)
-
-        x = self.final_norm(x)
-
-        if return_sequence:
-            return x
-        else:
-            return x[:, -1, :]  # Return last timestep
-
-    def get_output_dim(self) -> int:
-        """Return output dimension."""
-        return self.d_model
-
-
-class LSTMPriceEncoder(nn.Module):
-    """LSTM-based price encoder as alternative."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        n_layers: int = 2,
-        dropout: float = 0.1,
-        bidirectional: bool = True,
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
-        self.bidirectional = bidirectional
-
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.lstm = nn.LSTM(
-            hidden_dim,
-            hidden_dim,
-            num_layers=n_layers,
-            batch_first=True,
-            bidirectional=bidirectional,
-            dropout=dropout if n_layers > 1 else 0,
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(hidden_dim * (2 if bidirectional else 1))
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_sequence: bool = False,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, input_dim)
-
-        Returns:
-            (batch, hidden_dim * num_directions) or (batch, seq_len, hidden_dim * num_directions)
-        """
-        x = self.input_proj(x)
-        output, (hidden, cell) = self.lstm(x)
-        output = self.norm(output)
-
-        if return_sequence:
-            return self.dropout(output)
-        else:
-            # Concatenate final hidden states from both directions
-            if self.bidirectional:
-                final = torch.cat([hidden[-2], hidden[-1]], dim=-1)
-            else:
-                final = hidden[-1]
-            return self.dropout(final)
-
-    def get_output_dim(self) -> int:
-        """Return output dimension."""
-        return self.hidden_dim * (2 if self.bidirectional else 1)
+        batch_size, window_size, _ = x.shape
+        
+        # Project input
+        x = self.input_proj(x)  # (B, W, H)
+        
+        # Add time encoding
+        x = x + self.time_encoding[:, :window_size, :]
+        
+        # Apply layer norm
+        x = self.ln1(x)
+        
+        # Multi-scale convolutional features
+        conv_features = []
+        x_conv = x.transpose(1, 2)  # (B, H, W)
+        
+        for conv in self.conv_layers:
+            feat = conv(x_conv)
+            feat = F.gelu(feat)
+            feat = feat.transpose(1, 2)  # (B, W, H)
+            conv_features.append(feat)
+        
+        # Concatenate multi-scale features
+        conv_features = torch.cat(conv_features, dim=-1)  # (B, W, H*3)
+        
+        # Project back to hidden dim
+        conv_features = self.output_proj(conv_features)
+        
+        # Self-attention
+        attn_out, _ = self.attention(x, x, x)
+        attn_out = self.dropout(attn_out)
+        
+        # Residual connection
+        x = x + attn_out
+        x = self.ln2(x)
+        
+        # Combine conv and attention features
+        x = torch.cat([x, conv_features], dim=-1)
+        
+        # Final projection
+        x = self.output_proj(x)
+        
+        return x
