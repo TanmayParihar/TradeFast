@@ -7,6 +7,7 @@ system:
 
 data:
   symbols:
+    - BTCUSDT
     - ETHUSDT
     - BNBUSDT
     - SOLUSDT
@@ -14,6 +15,7 @@ data:
     - AVAXUSDT
     - DOGEUSDT
     - DOTUSDT
+    - MATICUSDT
     - XRPUSDT
   timeframe: "5m"  # Resampled from 1-minute data
   train_period:
