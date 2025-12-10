@@ -125,18 +125,34 @@ def print_classification_metrics(y_true, y_pred, model_name, symbol, class_names
 
 
 def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train LightGBM model with progress bar"""
+    """Train LightGBM model with progress bar and class balancing"""
     import lightgbm as lgb
     from tqdm import tqdm
-    
+    from collections import Counter
+
     logger = logging.getLogger(__name__)
     logger.info(f"Training LightGBM for {symbol}")
-    
+
     # Ensure output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Create dataset
-    train_data = lgb.Dataset(X_train, label=y_train)
+
+    # Calculate class weights for imbalanced data
+    class_counts = Counter(y_train)
+    total_samples = len(y_train)
+    num_classes = len(class_counts)
+
+    # Compute sample weights (inverse frequency weighting)
+    class_weights = {
+        cls: total_samples / (num_classes * count)
+        for cls, count in class_counts.items()
+    }
+    sample_weights = np.array([class_weights[y] for y in y_train])
+
+    logger.info(f"Class distribution: {dict(class_counts)}")
+    logger.info(f"Class weights: {class_weights}")
+
+    # Create dataset with sample weights
+    train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weights)
     val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
     
     # Get model parameters
@@ -234,18 +250,34 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
 
 
 def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
-    """Train XGBoost model with progress bar"""
+    """Train XGBoost model with progress bar and class balancing"""
     import xgboost as xgb
     from tqdm import tqdm
-    
+    from collections import Counter
+
     logger = logging.getLogger(__name__)
     logger.info(f"Training XGBoost for {symbol}")
-    
+
     # Ensure output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Create dataset
-    dtrain = xgb.DMatrix(X_train, label=y_train)
+
+    # Calculate class weights for imbalanced data
+    class_counts = Counter(y_train)
+    total_samples = len(y_train)
+    num_classes = len(class_counts)
+
+    # Compute sample weights (inverse frequency weighting)
+    class_weights = {
+        cls: total_samples / (num_classes * count)
+        for cls, count in class_counts.items()
+    }
+    sample_weights = np.array([class_weights[y] for y in y_train])
+
+    logger.info(f"Class distribution: {dict(class_counts)}")
+    logger.info(f"Class weights: {class_weights}")
+
+    # Create dataset with sample weights
+    dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weights)
     dval = xgb.DMatrix(X_val, label=y_val)
     
     # Get model parameters
