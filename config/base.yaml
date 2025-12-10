@@ -15,7 +15,7 @@ data:
     - DOGEUSDT
     - DOTUSDT
     - XRPUSDT
-  timeframe: "1m"
+  timeframe: "5m"  # Resampled from 1-minute data
   train_period:
     start: "2016-01-01"
     end: "2023-12-31"
@@ -106,7 +106,7 @@ models:
     dropout: 0.1
     learning_rate: 0.001
     batch_size: 64
-    seq_length: 64  # 64 minutes (~1 hour) - shorter for faster learning
+    seq_length: 64  # 64 bars x 5m = ~5.3 hours of context
   lightgbm:
     n_estimators: 500
     num_leaves: 31
@@ -157,8 +157,8 @@ strategy:
   triple_barrier:
     pt_mult: 2.0
     sl_mult: 1.0
-    max_holding: 240
-    vol_span: 1440
+    max_holding: 48    # 4 hours in 5-minute bars (was 240 for 1m)
+    vol_span: 288      # 1 day in 5-minute bars (was 1440 for 1m)
     min_vol: 0.0001
   position_sizing:
     method: kelly

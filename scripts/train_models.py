@@ -22,6 +22,9 @@ from datetime import datetime
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
+# Classification metrics imports
+from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
+
 # Import project modules
 from src.utils.config import load_config
 from src.utils.logging import setup_logging
@@ -30,6 +33,95 @@ from src.data.storage.parquet_store import ParquetStore
 from src.models.meta_labeling.triple_barrier import TripleBarrier
 from src.models.architectures.lightgbm_model import LightGBMModel
 from src.models.architectures.xgboost_model import XGBoostModel
+
+
+def print_classification_metrics(y_true, y_pred, model_name, symbol, class_names=None):
+    """
+    Print confusion matrix and per-class metrics.
+
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+        model_name: Name of the model for display
+        symbol: Trading symbol
+        class_names: Optional list of class names (default: ['Buy', 'Hold', 'Sell'])
+    """
+    logger = logging.getLogger(__name__)
+
+    if class_names is None:
+        class_names = ['Buy', 'Hold', 'Sell']
+
+    # Ensure arrays are numpy
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    # Get unique classes present
+    unique_classes = np.unique(np.concatenate([y_true, y_pred]))
+    present_class_names = [class_names[i] if i < len(class_names) else f'Class_{i}'
+                          for i in unique_classes]
+
+    print(f"\n{'='*70}")
+    print(f" {model_name} Classification Report - {symbol}")
+    print(f"{'='*70}")
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred)
+    print(f"\nConfusion Matrix:")
+    print(f"{'':>12}", end='')
+    for name in present_class_names:
+        print(f"{name:>10}", end='')
+    print(" (Predicted)")
+    print("-" * (12 + len(present_class_names) * 10))
+
+    for i, (row, name) in enumerate(zip(cm, present_class_names)):
+        print(f"{name:>10} |", end='')
+        for val in row:
+            print(f"{val:>10}", end='')
+        print()
+    print("(Actual)")
+
+    # Per-class metrics
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, average=None, labels=unique_classes, zero_division=0
+    )
+
+    print(f"\nPer-Class Metrics:")
+    print(f"{'Class':>12} {'Precision':>12} {'Recall':>12} {'F1-Score':>12} {'Support':>10}")
+    print("-" * 60)
+
+    for i, cls_name in enumerate(present_class_names):
+        print(f"{cls_name:>12} {precision[i]:>12.4f} {recall[i]:>12.4f} {f1[i]:>12.4f} {support[i]:>10}")
+
+    # Overall metrics
+    accuracy = np.mean(y_true == y_pred)
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='macro', zero_division=0
+    )
+    weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='weighted', zero_division=0
+    )
+
+    print("-" * 60)
+    print(f"{'Accuracy':>12} {accuracy:>12.4f}")
+    print(f"{'Macro Avg':>12} {macro_precision:>12.4f} {macro_recall:>12.4f} {macro_f1:>12.4f}")
+    print(f"{'Weighted':>12} {weighted_precision:>12.4f} {weighted_recall:>12.4f} {weighted_f1:>12.4f}")
+    print(f"{'='*70}\n")
+
+    # Log summary
+    logger.info(f"{model_name} {symbol}: Accuracy={accuracy:.4f}, Macro-F1={macro_f1:.4f}, Weighted-F1={weighted_f1:.4f}")
+
+    return {
+        'accuracy': accuracy,
+        'macro_f1': macro_f1,
+        'weighted_f1': weighted_f1,
+        'confusion_matrix': cm.tolist(),
+        'per_class': {
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'support': support.tolist()
+        }
+    }
 
 
 def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
@@ -126,9 +218,18 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     y_pred = bst.predict(X_val)
     y_pred_class = np.argmax(y_pred, axis=1)
     accuracy = np.mean(y_pred_class == y_val)
-    
+
     logger.info(f"LightGBM final validation accuracy: {accuracy:.4f}")
-    
+
+    # Print confusion matrix and per-class metrics
+    metrics = print_classification_metrics(y_val, y_pred_class, "LightGBM", symbol)
+
+    # Save metrics to JSON
+    import json
+    metrics_path = output_path / "lightgbm_metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
     return bst
 
 
@@ -229,9 +330,18 @@ def train_xgboost(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     y_pred = bst.predict(dval)
     y_pred_class = np.argmax(y_pred, axis=1)
     accuracy = np.mean(y_pred_class == y_val)
-    
+
     logger.info(f"XGBoost final validation accuracy: {accuracy:.4f}")
-    
+
+    # Print confusion matrix and per-class metrics
+    metrics = print_classification_metrics(y_val, y_pred_class, "XGBoost", symbol)
+
+    # Save metrics to JSON
+    import json
+    metrics_path = output_path / "xgboost_metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
     return bst
 
 
@@ -605,6 +715,35 @@ def train_mamba(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     logger.info(f"Best validation loss: {best_val_loss:.4f}")
     logger.info(f"Final validation accuracy: {val_accuracy:.4f}")
 
+    # Load best model for final predictions
+    best_model_path = output_path / "mamba_best.pt"
+    if best_model_path.exists():
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Loaded best model for final evaluation")
+
+    # Generate predictions for confusion matrix
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch_X, batch_y in val_loader:
+            batch_X = batch_X.to(device)
+            outputs = model(batch_X)
+            _, predicted = torch.max(outputs.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch_y.squeeze().numpy())
+
+    # Print confusion matrix and per-class metrics
+    metrics = print_classification_metrics(all_labels, all_preds, "Mamba", symbol)
+
+    # Save metrics to JSON
+    import json
+    metrics_path = output_path / "mamba_metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
     return model
 
 
@@ -912,6 +1051,35 @@ def train_tft(X_train, y_train, X_val, y_val, cfg, output_path, symbol):
     logger.info(f"TFT model saved to {output_path}")
     logger.info(f"Best validation loss: {best_val_loss:.4f}")
     logger.info(f"Final validation accuracy: {val_accuracy:.4f}")
+
+    # Load best model for final predictions
+    best_model_path = output_path / "tft_best.pt"
+    if best_model_path.exists():
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Loaded best model for final evaluation")
+
+    # Generate predictions for confusion matrix
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch_X, batch_y in val_loader:
+            batch_X = batch_X.to(device)
+            outputs = model(batch_X)
+            _, predicted = torch.max(outputs.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch_y.squeeze().numpy())
+
+    # Print confusion matrix and per-class metrics
+    metrics = print_classification_metrics(all_labels, all_preds, "TFT", symbol)
+
+    # Save metrics to JSON
+    import json
+    metrics_path = output_path / "tft_metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
 
     return model
 

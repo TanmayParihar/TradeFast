@@ -265,3 +265,82 @@ def load_all_available_data(
     loader = ExistingDataLoader(raw_path)
     symbols = loader.list_available_symbols()
     return loader.load_multiple(symbols, start, end)
+
+
+def resample_ohlcv(
+    df: pl.DataFrame,
+    timeframe: str = "5m",
+    time_column: str = "timestamp",
+) -> pl.DataFrame:
+    """
+    Resample OHLCV data to a higher timeframe.
+
+    Args:
+        df: DataFrame with OHLCV data (1-minute)
+        timeframe: Target timeframe ('5m', '15m', '30m', '1h', '4h', '1d')
+        time_column: Name of the timestamp column
+
+    Returns:
+        Resampled DataFrame
+    """
+    # Parse timeframe to duration
+    tf_map = {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1d",
+    }
+
+    if timeframe not in tf_map:
+        raise ValueError(f"Unsupported timeframe: {timeframe}. Use one of {list(tf_map.keys())}")
+
+    interval = tf_map[timeframe]
+
+    # Ensure timestamp column exists and is datetime
+    if time_column not in df.columns:
+        raise ValueError(f"Time column '{time_column}' not found in DataFrame")
+
+    # Detect column names (handle both lowercase and original case)
+    col_mapping = {}
+    for col in df.columns:
+        col_lower = col.lower()
+        if col_lower in ["open", "high", "low", "close", "volume"]:
+            col_mapping[col_lower] = col
+
+    if len(col_mapping) < 5:
+        raise ValueError(f"Missing OHLCV columns. Found: {list(col_mapping.keys())}")
+
+    open_col = col_mapping["open"]
+    high_col = col_mapping["high"]
+    low_col = col_mapping["low"]
+    close_col = col_mapping["close"]
+    volume_col = col_mapping["volume"]
+
+    # Sort by timestamp first
+    df = df.sort(time_column)
+
+    # Resample using group_by_dynamic
+    resampled = df.group_by_dynamic(
+        time_column,
+        every=interval,
+        closed="left",
+        label="left",
+    ).agg([
+        pl.col(open_col).first().alias("open"),
+        pl.col(high_col).max().alias("high"),
+        pl.col(low_col).min().alias("low"),
+        pl.col(close_col).last().alias("close"),
+        pl.col(volume_col).sum().alias("volume"),
+    ])
+
+    # Add returns column
+    resampled = resampled.with_columns([
+        (pl.col("close").pct_change()).alias("returns")
+    ])
+
+    logger.info(f"Resampled from {len(df):,} rows to {len(resampled):,} rows ({timeframe})")
+
+    return resampled

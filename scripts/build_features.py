@@ -15,11 +15,12 @@ def build(
     output_dir: str = typer.Option("data/features", help="Output directory"),
     start_date: str = typer.Option(None, help="Start date (YYYY-MM-DD)"),
     end_date: str = typer.Option(None, help="End date (YYYY-MM-DD)"),
+    timeframe: str = typer.Option("1m", help="Timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1d"),
 ):
     """Build features from raw data."""
     from src.utils.config import load_config
     from src.utils.logging import setup_logging
-    from src.data.loaders import ExistingDataLoader
+    from src.data.loaders import ExistingDataLoader, resample_ohlcv
     from src.data.storage import ParquetStore
     from src.features import FeaturePipeline
 
@@ -76,6 +77,22 @@ def build(
             continue
 
         logger.info(f"Loaded {len(ohlcv_df):,} rows for {symbol}")
+
+        # Resample to target timeframe if not 1m
+        if timeframe != "1m":
+            # Detect time column
+            time_col = None
+            for col in ["timestamp", "datetime", "time", "date", "open_time"]:
+                if col in ohlcv_df.columns:
+                    time_col = col
+                    break
+
+            if time_col is None:
+                logger.error(f"No timestamp column found for {symbol}, skipping resampling")
+            else:
+                original_rows = len(ohlcv_df)
+                ohlcv_df = resample_ohlcv(ohlcv_df, timeframe=timeframe, time_column=time_col)
+                logger.info(f"Resampled {symbol} from {original_rows:,} rows (1m) to {len(ohlcv_df):,} rows ({timeframe})")
 
         # Run feature pipeline (OHLCV only for now, other data sources can be added later)
         features_df = pipeline.run(
