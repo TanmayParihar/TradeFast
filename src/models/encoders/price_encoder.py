@@ -70,7 +70,7 @@ class MambaBlock(nn.Module):
         # Simplified SSM-like operation
         x_dbl = self.x_proj(x)
         dt, B = x_dbl.chunk(2, dim=-1)
-        dt = torch.softplus(self.dt_proj(dt))
+        dt = torch.nn.functional.softplus(self.dt_proj(dt))
 
         # Simple recurrence approximation
         x = x * dt
